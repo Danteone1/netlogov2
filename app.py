@@ -1,36 +1,30 @@
 """
-SITER-CDMX v5.4 — Mesa + Streamlit (estilo NetLogo)
-===================================================
-Gemelo Digital Sociofísico Territorial de la Ciudad de México.
-
-- Motor: Mesa (Agent-Based Modeling)
-- UI: Streamlit con controles estilo NetLogo (Setup / Go / Monitors)
-- 5 modos de datos: real | dummy | coherent | pure | calib
-- Jerarquía: Alcaldía → Sección (Manzana preparada)
-- Broker insertable
-- Behaviors intercambiables (camino a +35 modelos)
+SITER-CDMX v5.5 UNIFICADA
+=========================
+Todo junto:
+- Motor Mesa (estilo NetLogo) + Behaviors intercambiables
+- 5 modos de datos: real (CSV) | dummy | coherent | pure | calib
+- Mapa + análisis estadísticos + presupuesto + brigadistas
+- SPOF + funciones de respuesta al cliente + export
+- Sin geopandas obligatorio (Streamlit Cloud compatible)
 
 Ejecutar:
     pip install -r requirements.txt
-    streamlit run app_siter_cdmx_v54.py
+    streamlit run app_siter_cdmx_v55.py
 """
 from __future__ import annotations
 
-import hashlib
-import json
+import hashlib, json, uuid
 from collections import defaultdict, Counter
-from typing import Dict, List, Optional, Any
+from io import StringIO
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import networkx as nx
 import streamlit as st
 
-# Mesa
 from mesa import Agent, Model
-from mesa.time import SimultaneousActivation, RandomActivation
-from mesa.space import NetworkGrid
-from mesa.datacollection import DataCollector
 
 try:
     import plotly.express as px
@@ -52,545 +46,512 @@ except ImportError:
     HAS_YAML = False
 
 # =============================================================================
-# CONFIG Y CONSTANTES CDMX
+# CONSTANTES CDMX
 # =============================================================================
-CONFIG = {
-    "model": {"name": "voter", "beta": 1.2, "steps": 20, "seed": 42},
-    "simulation": {"n_agentes": 300},
-    "network": {"p_intra": 0.08, "p_inter": 0.02},
-}
-
-ALCALDIAS_CDMX = [
-    "ALVARO OBREGON", "AZCAPOTZALCO", "BENITO JUAREZ", "COYOACAN",
-    "CUAJIMALPA DE MORELOS", "CUAUHTEMOC", "GUSTAVO A MADERO",
-    "IZTACALCO", "IZTAPALAPA", "LA MAGDALENA CONTRERAS",
-    "MIGUEL HIDALGO", "MILPA ALTA", "TLAHUAC", "TLALPAN",
-    "VENUSTIANO CARRANZA", "XOCHIMILCO"
+ALCALDIAS = [
+    "ALVARO OBREGON","AZCAPOTZALCO","BENITO JUAREZ","COYOACAN",
+    "CUAJIMALPA DE MORELOS","CUAUHTEMOC","GUSTAVO A MADERO",
+    "IZTACALCO","IZTAPALAPA","LA MAGDALENA CONTRERAS",
+    "MIGUEL HIDALGO","MILPA ALTA","TLAHUAC","TLALPAN",
+    "VENUSTIANO CARRANZA","XOCHIMILCO"
 ]
-
 ALCALDIA_COORDS = {
-    "CUAUHTEMOC": (19.4326, -99.1332), "BENITO JUAREZ": (19.3984, -99.1576),
-    "MIGUEL HIDALGO": (19.4285, -99.2000), "COYOACAN": (19.3467, -99.1617),
-    "IZTAPALAPA": (19.3550, -99.0620), "GUSTAVO A MADERO": (19.4900, -99.1100),
-    "ALVARO OBREGON": (19.3580, -99.2270), "TLALPAN": (19.2880, -99.1670),
-    "XOCHIMILCO": (19.2630, -99.1040), "VENUSTIANO CARRANZA": (19.4200, -99.1000),
-    "AZCAPOTZALCO": (19.4870, -99.1860), "IZTACALCO": (19.3950, -99.0980),
-    "CUAJIMALPA DE MORELOS": (19.3570, -99.2900), "LA MAGDALENA CONTRERAS": (19.3200, -99.2400),
-    "TLAHUAC": (19.2700, -99.0050), "MILPA ALTA": (19.1920, -99.0230),
+    "CUAUHTEMOC":(19.4326,-99.1332),"BENITO JUAREZ":(19.3984,-99.1576),
+    "MIGUEL HIDALGO":(19.4285,-99.2000),"COYOACAN":(19.3467,-99.1617),
+    "IZTAPALAPA":(19.3550,-99.0620),"GUSTAVO A MADERO":(19.4900,-99.1100),
+    "ALVARO OBREGON":(19.3580,-99.2270),"TLALPAN":(19.2880,-99.1670),
+    "XOCHIMILCO":(19.2630,-99.1040),"VENUSTIANO CARRANZA":(19.4200,-99.1000),
+    "AZCAPOTZALCO":(19.4870,-99.1860),"IZTACALCO":(19.3950,-99.0980),
+    "CUAJIMALPA DE MORELOS":(19.3570,-99.2900),"LA MAGDALENA CONTRERAS":(19.3200,-99.2400),
+    "TLAHUAC":(19.2700,-99.0050),"MILPA ALTA":(19.1920,-99.0230),
 }
+COLOR_INT = {"SIMPATIZANTE":"#2ecc71","OPOSITOR":"#e74c3c","INDECISO":"#95a5a6"}
+CAMPO_COLOR = {"CONSOLIDACION":"#2ecc71","DISPUTA_ABIERTA":"#e74c3c","CONTENCION":"#3498db"}
 
-COLOR_INTENCION = {"SIMPATIZANTE": "#2ecc71", "OPOSITOR": "#e74c3c", "INDECISO": "#95a5a6"}
-COLOR_RGBA = {
-    "SIMPATIZANTE": [46, 204, 113, 200],
-    "OPOSITOR": [231, 76, 60, 200],
-    "INDECISO": [149, 165, 166, 180],
-    "BROKER": [255, 215, 0, 255],
-}
-
-def sha256(v) -> str:
-    p = v if isinstance(v, str) else json.dumps(v, sort_keys=True, default=str)
+def sha256(v):
+    p = v if isinstance(v,str) else json.dumps(v,sort_keys=True,default=str)
     return hashlib.sha256(p.encode()).hexdigest()
 
+def campo_de(simpat, indec):
+    if simpat >= 0.5: return "CONSOLIDACION"
+    if indec >= 0.35: return "DISPUTA_ABIERTA"
+    return "CONTENCION"
+
 # =============================================================================
-# BEHAVIORS (aquí se irán sumando los +35 modelos)
+# BEHAVIORS (Mesa)
 # =============================================================================
 class Behavior:
-    """Contrato común para todos los modelos sociofísicos."""
-    name = "base"
-
-    def __init__(self, params: dict | None = None):
-        self.params = params or {}
-
-    def step_agent(self, agent: "SeccionAgent"):
-        raise NotImplementedError
-
+    name="base"
+    def __init__(self, params=None): self.params=params or {}
+    def step_agent(self, agent): raise NotImplementedError
 
 class VoterBehavior(Behavior):
-    """Voter clásico ponderado por influencia."""
-    name = "voter"
-
+    name="voter"
     def step_agent(self, agent):
-        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
-        if not neighbors:
-            return
-        other = agent.random.choice(neighbors)
-        beta = self.params.get("beta", 1.2)
-        prob = min(0.9, other.influencia * beta)
-        if agent.es_broker:
-            prob *= 0.3  # resistencia
-        if agent.spin != other.spin and agent.random.random() < prob:
-            agent.spin = other.spin
-            agent.opinion = 0.7 if agent.spin == 1 else (-0.7 if agent.spin == -1 else 0.0)
-            agent.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[agent.spin]
-
+        ns=list(agent.get_neighbors())
+        if not ns: return
+        other=agent.random.choice(ns)
+        prob=min(0.9, other.influencia*self.params.get("beta",1.2))
+        if agent.es_broker: prob*=0.3
+        if agent.spin!=other.spin and agent.random.random()<prob:
+            agent.spin=other.spin
+            agent.opinion=0.7 if agent.spin==1 else (-0.7 if agent.spin==-1 else 0.0)
+            agent.intencion={1:"SIMPATIZANTE",-1:"OPOSITOR",0:"INDECISO"}[agent.spin]
 
 class DeffuantBehavior(Behavior):
-    """Bounded confidence + repulsión."""
-    name = "deffuant"
-
+    name="deffuant"
     def step_agent(self, agent):
-        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
-        if not neighbors:
-            return
-        other = agent.random.choice(neighbors)
-        mu = self.params.get("mu", 0.3)
-        eps = self.params.get("epsilon", 0.40)
-        eps_rep = self.params.get("epsilon_rep", 0.80)
-        d = abs(agent.opinion - other.opinion)
-        if d < eps:
-            delta = mu * (other.opinion - agent.opinion)
-            agent.opinion = float(np.clip(agent.opinion + delta, -1, 1))
-            other.opinion = float(np.clip(other.opinion - delta, -1, 1))
-        elif d > eps_rep:
-            delta = 0.2 * mu * (other.opinion - agent.opinion)
-            agent.opinion = float(np.clip(agent.opinion - delta, -1, 1))
-            other.opinion = float(np.clip(other.opinion + delta, -1, 1))
-        # actualizar spin
-        agent.spin = 1 if agent.opinion > 0.25 else (-1 if agent.opinion < -0.25 else 0)
-        agent.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[agent.spin]
-
+        ns=list(agent.get_neighbors())
+        if not ns: return
+        other=agent.random.choice(ns)
+        mu,eps,eps_rep=self.params.get("mu",0.3),self.params.get("epsilon",0.4),self.params.get("epsilon_rep",0.8)
+        d=abs(agent.opinion-other.opinion)
+        if d<eps:
+            delta=mu*(other.opinion-agent.opinion)
+            agent.opinion=float(np.clip(agent.opinion+delta,-1,1))
+            other.opinion=float(np.clip(other.opinion-delta,-1,1))
+        elif d>eps_rep:
+            delta=0.2*mu*(other.opinion-agent.opinion)
+            agent.opinion=float(np.clip(agent.opinion-delta,-1,1))
+            other.opinion=float(np.clip(other.opinion+delta,-1,1))
+        agent.spin=1 if agent.opinion>0.25 else (-1 if agent.opinion<-0.25 else 0)
+        agent.intencion={1:"SIMPATIZANTE",-1:"OPOSITOR",0:"INDECISO"}[agent.spin]
 
 class ABMSAFBehavior(Behavior):
-    """Comportamiento compuesto inspirado en el ABM-SAF original."""
-    name = "abm_saf"
-
+    name="abm_saf"
     def step_agent(self, agent):
-        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
-        if not neighbors:
-            return
-        if agent.fatiga > 0.8 and agent.random.random() < 0.7:
-            return
-        for other in neighbors:
-            prob = agent.influencia * 0.55 * self.params.get("beta", 1.2)
-            if agent.es_broker:
-                prob *= 1.45
-            if agent.random.random() < min(prob, 0.75):
-                # Deffuant parcial
-                d = abs(agent.opinion - other.opinion)
-                if d < 0.40:
-                    other.opinion = float(np.clip(other.opinion + 0.3 * (agent.opinion - other.opinion), -1, 1))
-                # Voter
-                if abs(agent.spin - other.spin) >= 1 and agent.spin != 0:
-                    other.spin = agent.spin
-                    other.opinion = 0.7 if other.spin == 1 else -0.7
-                    other.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[other.spin]
-                agent.fatiga = min(1.0, agent.fatiga + 0.05)
-        agent.fatiga *= 0.95
+        ns=list(agent.get_neighbors())
+        if not ns: return
+        if agent.fatiga>0.8 and agent.random.random()<0.7: return
+        # presupuesto
+        if agent.model.presupuesto_activo:
+            if agent.model.dinero<=0 or agent.model.horas<=0: return
+        for other in ns:
+            prob=agent.influencia*0.55*self.params.get("beta",1.2)
+            if agent.es_broker: prob*=1.45
+            if agent.random.random()<min(prob,0.75):
+                d=abs(agent.opinion-other.opinion)
+                if d<0.40:
+                    other.opinion=float(np.clip(other.opinion+0.3*(agent.opinion-other.opinion),-1,1))
+                if abs(agent.spin-other.spin)>=1 and agent.spin!=0:
+                    other.spin=agent.spin
+                    other.opinion=0.7 if other.spin==1 else -0.7
+                    other.intencion={1:"SIMPATIZANTE",-1:"OPOSITOR",0:"INDECISO"}[other.spin]
+                    if agent.model.presupuesto_activo:
+                        costo=5.0 if agent.es_broker else float(agent.random.uniform(10,40))
+                        agent.model.dinero-=costo*0.1
+                        agent.model.horas-=1
+                agent.fatiga=min(1.0,agent.fatiga+0.05)
+        agent.fatiga*=0.95
 
-
-BEHAVIOR_REGISTRY = {
-    "voter": VoterBehavior,
-    "deffuant": DeffuantBehavior,
-    "abm_saf": ABMSAFBehavior,
-}
+BEHAVIORS={"voter":VoterBehavior,"deffuant":DeffuantBehavior,"abm_saf":ABMSAFBehavior}
 
 # =============================================================================
-# AGENTES MESA
+# AGENTE + MODELO MESA
 # =============================================================================
 class SeccionAgent(Agent):
-    """Agente territorial = Sección Electoral (extensible a Manzana)."""
-
-    def __init__(self, unique_id, model, alcaldia="CUAUHTEMOC", seccion="0001",
+    def __init__(self, model, alcaldia="CUAUHTEMOC", seccion="0001",
                  lat=19.43, lon=-99.13, opinion=0.0, capital_social=0.5,
-                 influencia=0.5, es_broker=False, es_adversario=False, **kwargs):
-        super().__init__(unique_id, model)
-        self.alcaldia = alcaldia
-        self.seccion = str(seccion)
-        self.lat = lat
-        self.lon = lon
-        self.opinion = float(opinion)
-        self.spin = 1 if self.opinion > 0.25 else (-1 if self.opinion < -0.25 else 0)
-        self.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[self.spin]
-        self.capital_social = capital_social
-        self.influencia = influencia
-        self.fatiga = 0.0
-        self.es_broker = es_broker
-        self.es_adversario = es_adversario
-        self.level = "seccion"  # preparado para manzana / utm
+                 influencia=0.5, es_broker=False, **kw):
+        super().__init__(model)
+        self.alcaldia=alcaldia; self.seccion=str(seccion)
+        self.lat=float(lat); self.lon=float(lon)
+        self.opinion=float(opinion)
+        self.spin=1 if self.opinion>0.25 else (-1 if self.opinion<-0.25 else 0)
+        self.intencion={1:"SIMPATIZANTE",-1:"OPOSITOR",0:"INDECISO"}[self.spin]
+        self.capital_social=capital_social; self.influencia=influencia
+        self.fatiga=0.0; self.es_broker=es_broker; self._neighbors=[]
+    def get_neighbors(self): return self._neighbors
+    def step(self): self.model.behavior.step_agent(self)
 
-    def step(self):
-        self.model.behavior.step_agent(self)
-
-
-# =============================================================================
-# MODELO MESA PRINCIPAL
-# =============================================================================
 class SITERModel(Model):
-    """Mundo CDMX estilo NetLogo implementado en Mesa."""
+    def __init__(self, df, adj, behavior="voter", seed=42, presupuesto=None, **params):
+        super().__init__(seed=seed)
+        self._seed=seed; self.adj=adj; self.agents_list=[]
+        self.behavior=BEHAVIORS.get(behavior,VoterBehavior)(params)
+        self.behavior_name=behavior
+        self.presupuesto_activo=presupuesto is not None
+        self.dinero=float((presupuesto or {}).get("dinero",999999))
+        self.horas=float((presupuesto or {}).get("horas",999999))
+        for i,row in df.reset_index(drop=True).iterrows():
+            a=SeccionAgent(model=self,
+                alcaldia=row.get("alcaldia","CUAUHTEMOC"),
+                seccion=row.get("seccion",row.get("territorial_unit_id",f"{i:04d}")),
+                lat=float(row.get("lat",19.43)), lon=float(row.get("lon",-99.13)),
+                opinion=float(row.get("opinion_continua",0.0)),
+                capital_social=float(row.get("capital_social",0.5)),
+                influencia=float(row.get("influencia_SAF",row.get("habilidades_sociales",0.5))),
+                es_broker=bool(row.get("es_broker_insertado",False)))
+            a._idx=i; self.agents_list.append(a)
+        for a in self.agents_list:
+            a._neighbors=[self.agents_list[j] for j in adj.get(a._idx,[]) if j<len(self.agents_list)]
+        self._history=[]; self._collect()
 
-    def __init__(self, df_state: pd.DataFrame, adj: dict,
-                 behavior: str = "voter", seed: int = 42, **params):
-        super().__init__()
-        self.seed = seed
-        self.random.seed(seed)
-        np.random.seed(seed)
-
-        # Grafo de red
-        G = nx.Graph()
-        for i in range(len(df_state)):
-            G.add_node(i)
-        for k, vs in adj.items():
-            for v in vs:
-                if int(k) < len(df_state) and int(v) < len(df_state):
-                    G.add_edge(int(k), int(v))
-        self.G = G
-        self.grid = NetworkGrid(G)
-        self.schedule = SimultaneousActivation(self)
-
-        # Behavior intercambiable
-        behavior_cls = BEHAVIOR_REGISTRY.get(behavior, VoterBehavior)
-        self.behavior = behavior_cls(params)
-        self.behavior_name = behavior
-
-        # Crear agentes
-        for i, row in df_state.reset_index(drop=True).iterrows():
-            agent = SeccionAgent(
-                unique_id=i,
-                model=self,
-                alcaldia=row.get("alcaldia", "CUAUHTEMOC"),
-                seccion=row.get("seccion", row.get("territorial_unit_id", f"{i:04d}")),
-                lat=float(row.get("lat", 19.43)),
-                lon=float(row.get("lon", -99.13)),
-                opinion=float(row.get("opinion_continua", 0.0)),
-                capital_social=float(row.get("capital_social", 0.5)),
-                influencia=float(row.get("influencia_SAF", row.get("habilidades_sociales", 0.5))),
-                es_broker=bool(row.get("es_broker_insertado", False)),
-                es_adversario=bool(row.get("es_adversario", False)),
-            )
-            self.schedule.add(agent)
-            self.grid.place_agent(agent, i)
-
-        self.datacollector = DataCollector(
-            model_reporters={
-                "SIMPATIZANTE": lambda m: m.count_spin(1),
-                "OPOSITOR": lambda m: m.count_spin(-1),
-                "INDECISO": lambda m: m.count_spin(0),
-                "n_brokers": lambda m: sum(1 for a in m.schedule.agents if a.es_broker),
-            },
-            agent_reporters={"opinion": "opinion", "spin": "spin", "alcaldia": "alcaldia"}
-        )
-        self.datacollector.collect(self)  # estado inicial
-        self.running = True
-
-    def count_spin(self, value):
-        agents = self.schedule.agents
-        if not agents:
-            return 0.0
-        return sum(1 for a in agents if a.spin == value) / len(agents)
-
+    def _collect(self):
+        self._history.append({
+            "step":len(self._history),
+            "SIMPATIZANTE":self.count_spin(1),"OPOSITOR":self.count_spin(-1),"INDECISO":self.count_spin(0),
+            "dinero":self.dinero,"horas":self.horas
+        })
+    def count_spin(self,v):
+        return sum(1 for a in self.agents_list if a.spin==v)/max(len(self.agents_list),1)
     def step(self):
-        self.schedule.step()
-        self.datacollector.collect(self)
-
-    def get_agents_df(self) -> pd.DataFrame:
-        rows = []
-        for a in self.schedule.agents:
-            rows.append({
-                "agent_id": f"{'BROKER' if a.es_broker else 'SEC'}-{a.unique_id}",
-                "alcaldia": a.alcaldia,
-                "seccion": a.seccion,
-                "lat": a.lat,
-                "lon": a.lon,
-                "opinion": a.opinion,
-                "spin": a.spin,
-                "intencion": a.intencion,
-                "influencia": a.influencia,
-                "es_broker": a.es_broker,
-                "fatiga": a.fatiga,
-            })
-        return pd.DataFrame(rows)
-
-    def insert_broker(self, lat: float, lon: float, alcaldia: str,
-                      capital: float = 0.9, intencion: str = "SIMPATIZANTE",
-                      grado: int = 15):
-        """Inserta un broker en la ubicación dada y lo conecta a vecinos influyentes."""
-        new_id = max(a.unique_id for a in self.schedule.agents) + 1
-        opinion = 0.75 if intencion == "SIMPATIZANTE" else (-0.75 if intencion == "OPOSITOR" else 0.0)
-        broker = SeccionAgent(
-            unique_id=new_id, model=self, alcaldia=alcaldia, seccion=f"BRK{new_id}",
-            lat=lat, lon=lon, opinion=opinion, capital_social=capital,
-            influencia=0.95, es_broker=True
-        )
-        self.schedule.add(broker)
-        # Conectar a los más influyentes de la misma alcaldía o cercanos
-        candidatos = sorted(
-            [a for a in self.schedule.agents if a.unique_id != new_id],
-            key=lambda x: x.influencia, reverse=True
-        )[:grado * 2]
-        self.G.add_node(new_id)
-        for c in candidatos[:grado]:
-            self.G.add_edge(new_id, c.unique_id)
-        self.grid.place_agent(broker, new_id)
-        return broker
-
+        order=list(self.agents_list); self.random.shuffle(order)
+        for a in order: a.step()
+        self._collect()
+    def get_df(self):
+        return pd.DataFrame([{
+            "agent_id":f"{'BRK' if a.es_broker else 'SEC'}-{a._idx}",
+            "alcaldia":a.alcaldia,"seccion":a.seccion,"lat":a.lat,"lon":a.lon,
+            "opinion":a.opinion,"spin":a.spin,"intencion":a.intencion,
+            "influencia":a.influencia,"es_broker":a.es_broker,"fatiga":a.fatiga
+        } for a in self.agents_list])
+    def insert_broker(self, lat, lon, alcaldia, capital=0.9, intencion="SIMPATIZANTE", grado=12):
+        idx=len(self.agents_list)
+        op=0.75 if intencion=="SIMPATIZANTE" else (-0.75 if intencion=="OPOSITOR" else 0.0)
+        b=SeccionAgent(model=self,alcaldia=alcaldia,seccion=f"BRK{idx}",lat=lat,lon=lon,
+                       opinion=op,capital_social=capital,influencia=0.95,es_broker=True)
+        b._idx=idx
+        cands=sorted(self.agents_list,key=lambda x:x.influencia,reverse=True)[:grado]
+        b._neighbors=cands
+        for c in cands:
+            if b not in c._neighbors: c._neighbors.append(b)
+        self.agents_list.append(b); return b
 
 # =============================================================================
-# DATA PROVIDER (5 modos) — simplificado y compatible
+# DATA PROVIDER — 5 MODOS
 # =============================================================================
 class DataProvider:
     def __init__(self, mode="synth_pure", seed=42):
-        self.mode = mode
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
+        self.mode=mode; self.seed=seed; self.rng=np.random.default_rng(seed)
 
-    def load(self, n=300, **kwargs):
-        if self.mode == "dummy":
-            return self._dummy(n)
-        if self.mode == "synth_coherent":
-            return self._coherent(n)
-        if self.mode == "synth_calib":
-            return self._calib(kwargs.get("scenario", "polarizacion_alta"), n)
-        # default: synth_pure
+    def load(self, n=300, secciones_csv=None, electoral_csv=None, socio_csv=None, **kw):
+        if self.mode=="real":
+            return self._real(secciones_csv, electoral_csv, socio_csv)
+        if self.mode=="dummy": return self._pure(min(n,48))
+        if self.mode=="synth_coherent": return self._coherent(n)
+        if self.mode=="synth_calib": return self._calib(n, kw.get("scenario","polarizacion_alta"))
         return self._pure(n)
 
-    def _pure(self, n):
-        rows = []
+    def _real(self, sec_csv, elec_csv, socio_csv):
+        if sec_csv is None:
+            raise ValueError("Modo real requiere CSV de secciones")
+        df=pd.read_csv(sec_csv) if not hasattr(sec_csv,"read") else pd.read_csv(sec_csv)
+        df.columns=[c.strip().lower() for c in df.columns]
+        df["seccion"]=df["seccion"].astype(str).str.zfill(4)
+        df["alcaldia"]=df["alcaldia"].str.upper().str.strip()
+        if "lat" not in df.columns:
+            df["lat"]=df["alcaldia"].map(lambda a: ALCALDIA_COORDS.get(a,(19.43,-99.13))[0]+self.rng.normal(0,0.008))
+            df["lon"]=df["alcaldia"].map(lambda a: ALCALDIA_COORDS.get(a,(19.43,-99.13))[1]+self.rng.normal(0,0.008))
+        if elec_csv is not None:
+            elec=pd.read_csv(elec_csv) if not hasattr(elec_csv,"read") else pd.read_csv(elec_csv)
+            elec.columns=[c.strip().lower() for c in elec.columns]
+            elec["seccion"]=elec["seccion"].astype(str).str.zfill(4)
+            if "votos" in elec.columns and "partido_o_coalicion" in elec.columns:
+                piv=elec.pivot_table(index="seccion",columns="partido_o_coalicion",values="votos",aggfunc="sum",fill_value=0)
+                total=piv.sum(axis=1).replace(0,np.nan)
+                share=(piv.max(axis=1)/total).fillna(0.33)
+                df=df.merge(share.rename("share_max"),left_on="seccion",right_index=True,how="left")
+                df["opinion_continua"]=(df["share_max"].fillna(0.33)*2-1).clip(-1,1)
+            else:
+                df["opinion_continua"]=0.0
+        else:
+            df["opinion_continua"]=0.0
+        if socio_csv is not None:
+            socio=pd.read_csv(socio_csv) if not hasattr(socio_csv,"read") else pd.read_csv(socio_csv)
+            socio.columns=[c.strip().lower() for c in socio.columns]
+            socio["seccion"]=socio["seccion"].astype(str).str.zfill(4)
+            df=df.merge(socio,on="seccion",how="left",suffixes=("", "_s"))
+        df["capital_social"]=df.get("escolaridad_prom",pd.Series([10]*len(df))).fillna(10)/15
+        df["influencia_SAF"]=df["capital_social"].clip(0,1)*0.7+0.2
+        df["es_broker_insertado"]=False
+        meta={"mode":"real","n_nodes":len(df),"hash":sha256(str(df["seccion"].tolist()[:20]))}
+        return df, self._adj(df), meta
+
+    def _pure(self,n):
+        rows=[]
         for i in range(n):
-            alc = str(self.rng.choice(ALCALDIAS_CDMX))
-            lat, lon = ALCALDIA_COORDS[alc]
-            opinion = float(self.rng.uniform(-0.8, 0.8))
-            rows.append({
-                "seccion": f"{i:04d}", "alcaldia": alc,
-                "lat": lat + self.rng.normal(0, 0.012),
-                "lon": lon + self.rng.normal(0, 0.012),
-                "opinion_continua": opinion,
-                "capital_social": float(self.rng.uniform(0.3, 0.8)),
-                "influencia_SAF": float(self.rng.uniform(0.2, 0.9)),
-                "es_broker_insertado": False, "es_adversario": False,
-            })
-        df = pd.DataFrame(rows)
-        adj = self._build_adj(df)
-        return df, adj
+            alc=str(self.rng.choice(ALCALDIAS)); lat,lon=ALCALDIA_COORDS[alc]
+            rows.append({"seccion":f"{i:04d}","alcaldia":alc,
+                "lat":lat+self.rng.normal(0,0.012),"lon":lon+self.rng.normal(0,0.012),
+                "opinion_continua":float(self.rng.uniform(-0.8,0.8)),
+                "capital_social":float(self.rng.uniform(0.3,0.8)),
+                "influencia_SAF":float(self.rng.uniform(0.2,0.9)),"es_broker_insertado":False})
+        df=pd.DataFrame(rows)
+        return df,self._adj(df),{"mode":"synth_pure","n_nodes":len(df),"hash":sha256(f"pure-{n}-{self.seed}")}
 
-    def _dummy(self, n):
-        return self._pure(min(n, 60))
-
-    def _coherent(self, n):
-        rows = []
+    def _coherent(self,n):
+        rows=[]
         for i in range(n):
-            alc = str(self.rng.choice(ALCALDIAS_CDMX))
-            lat, lon = ALCALDIA_COORDS[alc]
-            share = float(np.clip(self.rng.normal(0.37, 0.14), 0.05, 0.95))
-            opinion = 2 * share - 1
-            rows.append({
-                "seccion": f"C{i:04d}", "alcaldia": alc,
-                "lat": lat + self.rng.normal(0, 0.01),
-                "lon": lon + self.rng.normal(0, 0.01),
-                "opinion_continua": opinion,
-                "capital_social": float(np.clip(1 - self.rng.normal(0.4, 0.15), 0.2, 0.9)),
-                "influencia_SAF": float(self.rng.uniform(0.3, 0.85)),
-                "es_broker_insertado": False, "es_adversario": False,
-            })
-        df = pd.DataFrame(rows)
-        adj = self._build_adj(df, p_intra=0.07, p_inter=0.02)
-        return df, adj
+            alc=str(self.rng.choice(ALCALDIAS)); lat,lon=ALCALDIA_COORDS[alc]
+            share=float(np.clip(self.rng.normal(0.37,0.14),0.05,0.95))
+            rows.append({"seccion":f"C{i:04d}","alcaldia":alc,
+                "lat":lat+self.rng.normal(0,0.01),"lon":lon+self.rng.normal(0,0.01),
+                "opinion_continua":2*share-1,
+                "capital_social":float(np.clip(1-self.rng.normal(0.4,0.15),0.2,0.9)),
+                "influencia_SAF":float(self.rng.uniform(0.3,0.85)),"es_broker_insertado":False})
+        df=pd.DataFrame(rows)
+        return df,self._adj(df,0.07,0.02),{"mode":"synth_coherent","n_nodes":len(df),"hash":sha256(f"coh-{n}")}
 
-    def _calib(self, scenario, n):
-        # polarizacion_alta simplificada
-        half = n // 2
-        rows = []
+    def _calib(self,n,scenario="polarizacion_alta"):
+        half=n//2; rows=[]
         for i in range(n):
-            bloque = 0 if i < half else 1
-            alc = ALCALDIAS_CDMX[bloque * 4 + (i % 4)]
-            lat, lon = ALCALDIA_COORDS[alc]
-            opinion = 0.75 if bloque == 0 else -0.75
-            opinion = float(np.clip(opinion + self.rng.normal(0, 0.08), -1, 1))
-            rows.append({
-                "seccion": f"P{i:04d}", "alcaldia": alc,
-                "lat": lat + self.rng.normal(0, 0.008),
-                "lon": lon + self.rng.normal(0, 0.008),
-                "opinion_continua": opinion,
-                "capital_social": 0.6, "influencia_SAF": 0.5,
-                "es_broker_insertado": False, "es_adversario": False,
-            })
-        df = pd.DataFrame(rows)
-        adj = self._build_adj(df, p_intra=0.12, p_inter=0.005)
-        return df, adj
+            b=0 if i<half else 1; alc=ALCALDIAS[b*4+(i%4)]; lat,lon=ALCALDIA_COORDS[alc]
+            op=0.75 if b==0 else -0.75
+            op=float(np.clip(op+self.rng.normal(0,0.08),-1,1))
+            rows.append({"seccion":f"P{i:04d}","alcaldia":alc,
+                "lat":lat+self.rng.normal(0,0.008),"lon":lon+self.rng.normal(0,0.008),
+                "opinion_continua":op,"capital_social":0.6,"influencia_SAF":0.5,"es_broker_insertado":False})
+        df=pd.DataFrame(rows)
+        return df,self._adj(df,0.12,0.005),{"mode":"synth_calib","scenario":scenario,"n_nodes":len(df),"hash":sha256(f"cal-{scenario}-{n}")}
 
-    def _build_adj(self, df, p_intra=0.08, p_inter=0.02):
-        adj = defaultdict(list)
+    def _adj(self,df,p_intra=0.08,p_inter=0.02):
+        adj=defaultdict(list)
         for alc in df["alcaldia"].unique():
-            idxs = df.index[df["alcaldia"] == alc].tolist()
+            idxs=df.index[df["alcaldia"]==alc].tolist()
             for a in range(len(idxs)):
-                for b in range(a + 1, len(idxs)):
-                    if self.rng.random() < p_intra:
-                        x, y = idxs[a], idxs[b]
-                        adj[x].append(y)
-                        adj[y].append(x)
-        # inter simple
-        alcs = list(df["alcaldia"].unique())
-        for i, a1 in enumerate(alcs):
+                for b in range(a+1,len(idxs)):
+                    if self.rng.random()<p_intra:
+                        x,y=idxs[a],idxs[b]; adj[x].append(y); adj[y].append(x)
+        alcs=list(df["alcaldia"].unique())
+        for i,a1 in enumerate(alcs):
             for a2 in alcs[i+1:]:
-                idxs1 = df.index[df["alcaldia"] == a1].tolist()
-                idxs2 = df.index[df["alcaldia"] == a2].tolist()
-                for x in idxs1[:5]:
-                    for y in idxs2[:5]:
-                        if self.rng.random() < p_inter:
-                            adj[x].append(y)
-                            adj[y].append(x)
+                i1=df.index[df["alcaldia"]==a1].tolist()[:4]
+                i2=df.index[df["alcaldia"]==a2].tolist()[:4]
+                for x in i1:
+                    for y in i2:
+                        if self.rng.random()<p_inter:
+                            adj[x].append(y); adj[y].append(x)
         return dict(adj)
 
+# =============================================================================
+# ANÁLISIS ESTADÍSTICOS + SPOF + BRIGADAS + RESPUESTA AL CLIENTE
+# =============================================================================
+class Analisis:
+    @staticmethod
+    def territoriales(df):
+        res=[]
+        for alc in df["alcaldia"].unique():
+            sub=df[df["alcaldia"]==alc]
+            counts=sub["intencion"].value_counts(normalize=True)
+            simpat=(sub["intencion"]=="SIMPATIZANTE").mean()
+            opos=(sub["intencion"]=="OPOSITOR").mean()
+            indec=(sub["intencion"]=="INDECISO").mean()
+            ent=-sum(p*np.log(p) for p in counts if p>0)
+            res.append({"alcaldia":alc,"n":len(sub),"simpat_pct":round(simpat*100,1),
+                        "opos_pct":round(opos*100,1),"indec_pct":round(indec*100,1),
+                        "polarizacion":round(1-abs(simpat-opos),3),"entropia":round(ent,3),
+                        "campo":campo_de(simpat,indec),
+                        "influencia_prom":round(sub["influencia"].mean(),3)})
+        return pd.DataFrame(res)
+
+    @staticmethod
+    def spof(df, top_k=8):
+        # SPOF simplificado por influencia y grado aproximado
+        top=df.nlargest(top_k,"influencia")
+        rows=[]
+        for _,r in top.iterrows():
+            rows.append({"agent_id":r["agent_id"],"alcaldia":r["alcaldia"],
+                         "influencia":round(r["influencia"],3),
+                         "riesgo_spof":round(r["influencia"]*1.2,3)})
+        return pd.DataFrame(rows).sort_values("riesgo_spof",ascending=False)
+
+    @staticmethod
+    def brigadas(n_brig=4, pasos=8, seed=42):
+        rng=np.random.default_rng(seed); rutas=[]
+        for b in range(n_brig):
+            alc=str(rng.choice(ALCALDIAS)); lat,lon=ALCALDIA_COORDS[alc]
+            for step in range(pasos+1):
+                if step>0:
+                    alc=str(rng.choice(ALCALDIAS)); lat,lon=ALCALDIA_COORDS[alc]
+                    lat+=rng.normal(0,0.01); lon+=rng.normal(0,0.01)
+                rutas.append({"brigada":f"B-{b}","step":step,"lat":lat,"lon":lon,"alcaldia":alc})
+        return pd.DataFrame(rutas)
+
+    @staticmethod
+    def preguntas_cliente(df, df_terr):
+        """Funciones de respuesta rápida al cliente (calculadas)."""
+        filas=[]
+        def add(cat,q,a):
+            filas.append({"categoria":cat,"pregunta":q,"respuesta":str(a),"evidencia":"SIM-CALC"})
+        add("Global","¿Cuántas secciones/agentes hay?",len(df))
+        add("Global","¿Cuántas alcaldías?",df["alcaldia"].nunique())
+        if not df_terr.empty:
+            add("Global","¿Alcaldía con mayor simpatía?",f"{df_terr.loc[df_terr['simpat_pct'].idxmax(),'alcaldia']} ({df_terr['simpat_pct'].max()}%)")
+            add("Global","¿Alcaldía más polarizada?",f"{df_terr.loc[df_terr['polarizacion'].idxmax(),'alcaldia']}")
+            add("Global","¿Campo dominante?",df_terr["campo"].value_counts().idxmax())
+        add("Global","¿Agente más influyente?",df.loc[df["influencia"].idxmax(),"agent_id"] if len(df) else "—")
+        for _,r in df_terr.iterrows():
+            add(f"Alcaldía {r['alcaldia']}",f"[{r['alcaldia']}] Campo",r["campo"])
+            add(f"Alcaldía {r['alcaldia']}",f"[{r['alcaldia']}] Simpatía %",r["simpat_pct"])
+        return pd.DataFrame(filas)
 
 # =============================================================================
-# STREAMLIT UI — ESTILO NETLOGO
+# UI STREAMLIT
 # =============================================================================
-st.set_page_config(page_title="SITER-CDMX v5.4 Mesa", page_icon="🧠", layout="wide")
-st.title("🧠 SITER-CDMX v5.4 — Mesa + NetLogo-style")
-st.caption("Motor Mesa · Behaviors intercambiables · 5 modos de datos · Controles Setup/Go · CDMX")
+st.set_page_config(page_title="SITER-CDMX v5.5", page_icon="🧠", layout="wide")
+st.title("🧠 SITER-CDMX v5.5 — Unificada")
+st.caption("Mesa · NetLogo-style · 5 modos de datos · Mapa · Análisis · Presupuesto · Brigadas · Respuesta al cliente")
 
-if "s54" not in st.session_state:
-    st.session_state.s54 = {
-        "model": None, "df": pd.DataFrame(), "adj": {},
-        "tray": [], "running": False, "tick": 0,
-        "behavior": "voter", "meta": {}
-    }
-S = st.session_state.s54
+if "s55" not in st.session_state:
+    st.session_state.s55={"model":None,"df":pd.DataFrame(),"adj":{},"tray":[],"tick":0,
+                          "meta":{},"rutas":pd.DataFrame(),"presupuesto":None}
+S=st.session_state.s55
 
 # ----- SIDEBAR -----
-st.sidebar.header("⚙️ Setup (NetLogo-style)")
+st.sidebar.header("⚙️ Setup")
+data_mode=st.sidebar.selectbox("Modo de datos",["synth_pure","dummy","synth_coherent","synth_calib","real"])
+seed=st.sidebar.number_input("Seed",1,99999,42)
+n=st.sidebar.slider("N secciones",50,800,300,50)
+behavior=st.sidebar.selectbox("Behavior",list(BEHAVIORS.keys()))
+beta=st.sidebar.slider("Beta",0.3,2.5,1.2,0.1)
+steps_go=st.sidebar.slider("Pasos por Go",1,20,5)
 
-data_mode = st.sidebar.selectbox("Modo de datos", ["synth_pure", "dummy", "synth_coherent", "synth_calib"], index=0)
-seed = st.sidebar.number_input("Seed", 1, 99999, 42)
-n = st.sidebar.slider("N secciones", 50, 800, 300, 50)
-behavior = st.sidebar.selectbox("Behavior (modelo)", list(BEHAVIOR_REGISTRY.keys()), index=0)
-beta = st.sidebar.slider("Beta", 0.3, 2.5, 1.2, 0.1)
-steps_per_go = st.sidebar.slider("Pasos por Go", 1, 20, 5)
+# Presupuesto
+usar_pres=st.sidebar.checkbox("Activar presupuesto limitado")
+dinero_p=st.sidebar.number_input("Dinero $",500,20000,5000,500) if usar_pres else 999999
+horas_p=st.sidebar.number_input("Horas",20,500,100,10) if usar_pres else 999999
 
-if data_mode == "synth_calib":
-    scenario = st.sidebar.selectbox("Escenario", ["polarizacion_alta"])
-else:
-    scenario = "polarizacion_alta"
+# Real files
+sec_file=elec_file=socio_file=None
+if data_mode=="real":
+    st.sidebar.markdown("**CSV reales**")
+    sec_file=st.sidebar.file_uploader("Secciones (obligatorio)",type=["csv"])
+    elec_file=st.sidebar.file_uploader("Electoral (opcional)",type=["csv"])
+    socio_file=st.sidebar.file_uploader("Socio (opcional)",type=["csv"])
 
-col_setup, col_go, col_stop = st.sidebar.columns(3)
-
-with col_setup:
-    if st.button("🔄 Setup", use_container_width=True):
-        provider = DataProvider(mode=data_mode, seed=seed)
-        df, adj = provider.load(n=n, scenario=scenario)
-        model = SITERModel(df, adj, behavior=behavior, seed=seed, beta=beta)
-        S.update({
-            "model": model, "df": df, "adj": adj,
-            "tray": [{"step": 0, "SIMPATIZANTE": model.count_spin(1),
-                      "OPOSITOR": model.count_spin(-1), "INDECISO": model.count_spin(0)}],
-            "tick": 0, "running": False, "behavior": behavior
-        })
-        st.success(f"Setup OK · {len(df)} secciones · {behavior}")
-
-with col_go:
-    if st.button("▶️ Go", use_container_width=True):
-        if S["model"] is None:
-            st.warning("Haz Setup primero")
+c1,c2,c3=st.sidebar.columns(3)
+with c1:
+    if st.button("🔄 Setup",use_container_width=True):
+        try:
+            prov=DataProvider(mode=data_mode,seed=int(seed))
+            df,adj,meta=prov.load(n=n,secciones_csv=sec_file,electoral_csv=elec_file,socio_csv=socio_file)
+            pres={"dinero":dinero_p,"horas":horas_p} if usar_pres else None
+            model=SITERModel(df,adj,behavior=behavior,seed=int(seed),presupuesto=pres,beta=beta)
+            S.update({"model":model,"df":df,"adj":adj,"tray":list(model._history),
+                      "tick":0,"meta":meta,"presupuesto":pres})
+            st.success(f"Setup · {meta.get('mode')} · {meta.get('n_nodes')} nodos")
+        except Exception as e:
+            st.error(str(e))
+with c2:
+    if st.button("▶️ Go",use_container_width=True):
+        if S["model"] is None: st.warning("Setup primero")
         else:
-            for _ in range(steps_per_go):
-                S["model"].step()
-                S["tick"] += 1
-                S["tray"].append({
-                    "step": S["tick"],
-                    "SIMPATIZANTE": S["model"].count_spin(1),
-                    "OPOSITOR": S["model"].count_spin(-1),
-                    "INDECISO": S["model"].count_spin(0),
-                })
-            st.rerun()
+            for _ in range(steps_go):
+                S["model"].step(); S["tick"]+=1
+            S["tray"]=list(S["model"]._history); st.rerun()
+with c3:
+    if st.button("⏹ Reset",use_container_width=True):
+        S["model"]=None; S["tray"]=[]; S["tick"]=0; st.rerun()
 
-with col_stop:
-    if st.button("⏹ Reset", use_container_width=True):
-        S["model"] = None
-        S["tray"] = []
-        S["tick"] = 0
-        st.rerun()
-
-# Broker rápido
 st.sidebar.markdown("---")
-st.sidebar.subheader("🧠 Insertar Broker")
-broker_alc = st.sidebar.selectbox("Alcaldía del broker", ALCALDIAS_CDMX)
-broker_int = st.sidebar.selectbox("Intención", ["SIMPATIZANTE", "OPOSITOR", "INDECISO"])
+st.sidebar.subheader("🧠 Broker")
+b_alc=st.sidebar.selectbox("Alcaldía",ALCALDIAS)
+b_int=st.sidebar.selectbox("Intención",["SIMPATIZANTE","OPOSITOR","INDECISO"])
 if st.sidebar.button("➕ Insertar Broker"):
-    if S["model"] is None:
-        st.sidebar.warning("Haz Setup primero")
+    if S["model"] is None: st.sidebar.warning("Setup primero")
     else:
-        lat, lon = ALCALDIA_COORDS[broker_alc]
-        S["model"].insert_broker(lat, lon, broker_alc, capital=0.9, intencion=broker_int)
-        st.sidebar.success("Broker insertado")
-        st.rerun()
+        lat,lon=ALCALDIA_COORDS[b_alc]
+        S["model"].insert_broker(lat,lon,b_alc,intencion=b_int)
+        st.sidebar.success("Broker OK"); st.rerun()
 
-# ----- MAIN PANEL -----
+# ----- MAIN -----
 if S["model"] is None:
-    st.info("➡️ Pulsa **Setup** en la barra lateral para generar el universo (estilo NetLogo).")
+    st.info("➡️ **Setup** para generar el universo. Usa modo `real` + CSV de plantillas para datos base.")
+    st.markdown("""
+    **5 modos de datos**
+    - `real` → CSV secciones (+ electoral + socio)
+    - `dummy` → mínimo para pruebas
+    - `synth_coherent` → sintético realista CDMX
+    - `synth_pure` → sintético libre
+    - `synth_calib` → escenarios de calibración
+
+    **Incluye:** mapa, análisis por alcaldía, presupuesto, brigadas, SPOF, preguntas al cliente, export.
+    """)
 else:
-    model: SITERModel = S["model"]
-    agents_df = model.get_agents_df()
+    model:SITERModel=S["model"]
+    adf=model.get_df()
+    terr=Analisis.territoriales(adf)
 
-    # Monitors (estilo NetLogo)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Tick", S["tick"])
-    c2.metric("Simpatizantes", f"{model.count_spin(1):.1%}")
-    c3.metric("Opositores", f"{model.count_spin(-1):.1%}")
-    c4.metric("Indecisos", f"{model.count_spin(0):.1%}")
-    c5.metric("Brokers", sum(1 for a in model.schedule.agents if a.es_broker))
+    # Monitors
+    m1,m2,m3,m4,m5,m6=st.columns(6)
+    m1.metric("Tick",S["tick"])
+    m2.metric("Simpatizantes",f"{model.count_spin(1):.1%}")
+    m3.metric("Opositores",f"{model.count_spin(-1):.1%}")
+    m4.metric("Indecisos",f"{model.count_spin(0):.1%}")
+    m5.metric("Brokers",sum(1 for a in model.agents_list if a.es_broker))
+    if S.get("presupuesto"):
+        m6.metric("Presupuesto",f"${model.dinero:.0f} / {model.horas:.0f}h")
+    else:
+        m6.metric("Modo",S["meta"].get("mode","—"))
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ World View", "📈 Plots", "📋 Agentes", "ℹ️ Modelo"])
+    tabs=st.tabs(["🗺️ Mapa","📊 Análisis","💰 Presupuesto & Brigadas","🎯 SPOF & Cliente","📤 Export"])
 
-    with tab1:
-        st.subheader("World View (NetLogo-style)")
+    with tabs[0]:
         if HAS_PLOTLY:
-            fig = px.scatter(
-                agents_df, x="lon", y="lat",
-                color="intencion", size="influencia",
-                hover_name="agent_id",
-                color_discrete_map=COLOR_INTENCION,
-                hover_data=["alcaldia", "seccion", "opinion", "spin"],
-                title=f"Secciones CDMX · Behavior: {S['behavior']} · Tick {S['tick']}",
-                size_max=28
-            )
-            # Brokers como estrellas
-            brokers = agents_df[agents_df["es_broker"]]
-            if not brokers.empty:
-                fig.add_trace(go.Scatter(
-                    x=brokers["lon"], y=brokers["lat"],
-                    mode="markers", marker=dict(symbol="star", size=22, color="gold",
-                                                line=dict(width=1, color="black")),
-                    name="Broker", text=brokers["agent_id"]
-                ))
-            fig.update_layout(height=600, template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.dataframe(agents_df)
+            fig=px.scatter(adf,x="lon",y="lat",color="intencion",size="influencia",
+                           hover_name="agent_id",color_discrete_map=COLOR_INT,
+                           hover_data=["alcaldia","seccion","opinion"],
+                           title=f"CDMX · {model.behavior_name} · Tick {S['tick']}",size_max=24)
+            br=adf[adf["es_broker"]]
+            if not br.empty:
+                fig.add_trace(go.Scatter(x=br["lon"],y=br["lat"],mode="markers",
+                    marker=dict(symbol="star",size=18,color="gold",line=dict(width=1,color="black")),name="Broker"))
+            fig.update_layout(height=560,template="plotly_dark")
+            st.plotly_chart(fig,use_container_width=True)
+        st.dataframe(terr,use_container_width=True)
 
-        # Resumen por alcaldía
-        by_alc = agents_df.groupby("alcaldia")["intencion"].value_counts(normalize=True).unstack(fill_value=0)
-        st.markdown("**Distribución por Alcaldía**")
-        st.dataframe(by_alc.style.format("{:.1%}"), use_container_width=True)
-
-    with tab2:
+    with tabs[1]:
+        st.subheader("Indicadores por Alcaldía")
+        st.dataframe(terr,use_container_width=True)
+        if HAS_PLOTLY and not terr.empty:
+            st.plotly_chart(px.bar(terr,x="alcaldia",y="simpat_pct",color="campo",
+                                   color_discrete_map=CAMPO_COLOR,title="Simpatía % por Alcaldía"),
+                            use_container_width=True)
         if S["tray"]:
-            tray_df = pd.DataFrame(S["tray"])
-            st.line_chart(tray_df.set_index("step")[["SIMPATIZANTE", "OPOSITOR", "INDECISO"]])
+            tdf=pd.DataFrame(S["tray"])
+            st.line_chart(tdf.set_index("step")[["SIMPATIZANTE","OPOSITOR","INDECISO"]])
+
+    with tabs[2]:
+        st.subheader("Presupuesto")
+        if S.get("presupuesto") and S["tray"]:
+            tdf=pd.DataFrame(S["tray"])
+            if "dinero" in tdf.columns:
+                st.line_chart(tdf.set_index("step")[["dinero","horas"]])
+        else:
+            st.info("Activa presupuesto en el sidebar y haz Setup.")
+        st.subheader("Brigadistas")
+        nb=st.slider("N brigadas",1,8,4)
+        if st.button("Generar rutas de brigadas"):
+            S["rutas"]=Analisis.brigadas(nb,8,int(seed))
+        if not S["rutas"].empty:
             if HAS_PLOTLY:
-                fig = go.Figure()
-                for col, color in [("SIMPATIZANTE", "#2ecc71"), ("OPOSITOR", "#e74c3c"), ("INDECISO", "#95a5a6")]:
-                    fig.add_trace(go.Scatter(x=tray_df["step"], y=tray_df[col], name=col, line=dict(color=color)))
-                fig.update_layout(title="Trayectoria de opiniones", height=400, template="plotly_dark")
-                st.plotly_chart(fig, use_container_width=True)
+                fig=px.line(S["rutas"],x="lon",y="lat",color="brigada",markers=True,
+                            hover_data=["step","alcaldia"],title="Rutas de brigadas")
+                fig.update_layout(height=450,template="plotly_dark")
+                st.plotly_chart(fig,use_container_width=True)
+            st.dataframe(S["rutas"],use_container_width=True)
 
-    with tab3:
-        st.dataframe(agents_df, use_container_width=True)
+    with tabs[3]:
+        st.subheader("SPOF (puntos críticos)")
+        st.dataframe(Analisis.spof(adf),use_container_width=True)
+        st.subheader("Respuesta al cliente (preguntas calculadas)")
+        preg=Analisis.preguntas_cliente(adf,terr)
+        st.dataframe(preg,use_container_width=True)
 
-    with tab4:
-        st.json({
-            "behavior": S["behavior"],
-            "n_agents": len(model.schedule.agents),
-            "n_edges": model.G.number_of_edges(),
-            "tick": S["tick"],
-            "seed": model.seed,
-        })
-        st.markdown("""
-        **Behaviors disponibles (camino a +35 modelos):**
-        - `voter` — Voter clásico ponderado
-        - `deffuant` — Bounded confidence + repulsión
-        - `abm_saf` — Compuesto (Voter + Deffuant + fatiga)
-
-        Próximos: Threshold, q-Voter, Schelling, Complex Contagion, HK, DeGroot, FJ, Axelrod...
-        """)
+    with tabs[4]:
+        st.subheader("Export reproducible")
+        payload={
+            "meta":{"version":"siter-cdmx-v5.5","seed":S["model"]._seed,
+                    "behavior":model.behavior_name,"data":S["meta"],
+                    "tick":S["tick"],"hash":sha256(S["meta"])},
+            "territorial":terr.to_dict(orient="records"),
+            "trayectoria":S["tray"],
+            "governance":{"public":True,"personal":False,"agregado":True}
+        }
+        st.json({"hash":payload["meta"]["hash"][:16]+"…","n_alcaldias":len(terr),"ticks":S["tick"]})
+        st.download_button("⬇️ Descargar JSON",data=json.dumps(payload,ensure_ascii=False,indent=2,default=str),
+                           file_name="siter_cdmx_export.json",mime="application/json")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("SITER-CDMX v5.4 · Mesa · Estilo NetLogo · Sin PII")
+st.sidebar.caption("SITER-CDMX v5.5 unificada · Mesa · Sin PII")
