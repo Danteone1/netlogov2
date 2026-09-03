@@ -1,5 +1,7 @@
-streamlit>=1.40
-numpy>=1.26
-pandas>=2.2
-networkx>=3.3
-plotly>=5.24
+streamlit>=1.40,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+plotly>=5.24,<7
+pyyaml>=6,<7
+networkx>=3.3,<4
+mesa>=3.0,<4
