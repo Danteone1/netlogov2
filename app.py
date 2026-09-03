@@ -1,836 +1,596 @@
+"""
+SITER-CDMX v5.4 — Mesa + Streamlit (estilo NetLogo)
+===================================================
+Gemelo Digital Sociofísico Territorial de la Ciudad de México.
+
+- Motor: Mesa (Agent-Based Modeling)
+- UI: Streamlit con controles estilo NetLogo (Setup / Go / Monitors)
+- 5 modos de datos: real | dummy | coherent | pure | calib
+- Jerarquía: Alcaldía → Sección (Manzana preparada)
+- Broker insertable
+- Behaviors intercambiables (camino a +35 modelos)
+
+Ejecutar:
+    pip install -r requirements.txt
+    streamlit run app_siter_cdmx_v54.py
+"""
+from __future__ import annotations
 
 import hashlib
-import io
 import json
-import math
-from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from collections import defaultdict, Counter
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 import pandas as pd
 import networkx as nx
-import plotly.graph_objects as go
 import streamlit as st
 
-# ============================================================
-# SITER-CDMX + MESA
-# Skeleton v5.4
-# Streamlit UI + Mesa ABM + interchangeable Behaviors
-#
-# Scope:
-# - CDMX only
-# - aggregated/synthetic territorial units
-# - no PII / no individual profiling
-# - opinion/state variables are simulation constructs, not voter
-#   predictions
-# ============================================================
+# Mesa
+from mesa import Agent, Model
+from mesa.time import SimultaneousActivation, RandomActivation
+from mesa.space import NetworkGrid
+from mesa.datacollection import DataCollector
 
 try:
-    from mesa import Agent, Model
-    from mesa.datacollection import DataCollector
-    MESA_OK = True
-except Exception as exc:
-    MESA_OK = False
-    MESA_IMPORT_ERROR = str(exc)
+    import plotly.express as px
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 try:
-    # Mesa 3.x compatibility path
-    from mesa.space import NetworkGrid as LegacyNetworkGrid
-except Exception:
-    LegacyNetworkGrid = None
+    import pydeck as pdk
+    HAS_PYDECK = True
+except ImportError:
+    HAS_PYDECK = False
 
 try:
-    # Mesa 3/4 newer API
-    from mesa.discrete_space import Network as MesaNetwork
-except Exception:
-    MesaNetwork = None
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
-
-CDMX_ALCALDIAS = [
-    "ÁLVARO OBREGÓN", "AZCAPOTZALCO", "BENITO JUÁREZ",
-    "COYOACÁN", "CUAJIMALPA DE MORELOS", "CUAUHTÉMOC",
-    "GUSTAVO A. MADERO", "IZTACALCO", "IZTAPALAPA",
-    "LA MAGDALENA CONTRERAS", "MIGUEL HIDALGO", "MILPA ALTA",
-    "TLÁHUAC", "TLALPAN", "VENUSTIANO CARRANZA", "XOCHIMILCO"
-]
-
-DEFAULTS = {
-    "n_agents": 120,
-    "p_intra": 0.06,
-    "p_inter": 0.015,
-    "initial_opinion": 0.0,
-    "seed": 42,
-    "steps": 50,
-    "confidence": 0.25,
-    "noise": 0.02,
-    "threshold": 0.50,
-    "shock": 0.0,
+# =============================================================================
+# CONFIG Y CONSTANTES CDMX
+# =============================================================================
+CONFIG = {
+    "model": {"name": "voter", "beta": 1.2, "steps": 20, "seed": 42},
+    "simulation": {"n_agentes": 300},
+    "network": {"p_intra": 0.08, "p_inter": 0.02},
 }
 
+ALCALDIAS_CDMX = [
+    "ALVARO OBREGON", "AZCAPOTZALCO", "BENITO JUAREZ", "COYOACAN",
+    "CUAJIMALPA DE MORELOS", "CUAUHTEMOC", "GUSTAVO A MADERO",
+    "IZTACALCO", "IZTAPALAPA", "LA MAGDALENA CONTRERAS",
+    "MIGUEL HIDALGO", "MILPA ALTA", "TLAHUAC", "TLALPAN",
+    "VENUSTIANO CARRANZA", "XOCHIMILCO"
+]
 
-def sha256_obj(obj: Any) -> str:
-    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+ALCALDIA_COORDS = {
+    "CUAUHTEMOC": (19.4326, -99.1332), "BENITO JUAREZ": (19.3984, -99.1576),
+    "MIGUEL HIDALGO": (19.4285, -99.2000), "COYOACAN": (19.3467, -99.1617),
+    "IZTAPALAPA": (19.3550, -99.0620), "GUSTAVO A MADERO": (19.4900, -99.1100),
+    "ALVARO OBREGON": (19.3580, -99.2270), "TLALPAN": (19.2880, -99.1670),
+    "XOCHIMILCO": (19.2630, -99.1040), "VENUSTIANO CARRANZA": (19.4200, -99.1000),
+    "AZCAPOTZALCO": (19.4870, -99.1860), "IZTACALCO": (19.3950, -99.0980),
+    "CUAJIMALPA DE MORELOS": (19.3570, -99.2900), "LA MAGDALENA CONTRERAS": (19.3200, -99.2400),
+    "TLAHUAC": (19.2700, -99.0050), "MILPA ALTA": (19.1920, -99.0230),
+}
 
+COLOR_INTENCION = {"SIMPATIZANTE": "#2ecc71", "OPOSITOR": "#e74c3c", "INDECISO": "#95a5a6"}
+COLOR_RGBA = {
+    "SIMPATIZANTE": [46, 204, 113, 200],
+    "OPOSITOR": [231, 76, 60, 200],
+    "INDECISO": [149, 165, 166, 180],
+    "BROKER": [255, 215, 0, 255],
+}
 
-def clamp(x, lo=-1.0, hi=1.0):
-    return max(lo, min(hi, float(x)))
+def sha256(v) -> str:
+    p = v if isinstance(v, str) else json.dumps(v, sort_keys=True, default=str)
+    return hashlib.sha256(p.encode()).hexdigest()
 
-
-def gini(values):
-    x = np.asarray(values, dtype=float)
-    if len(x) == 0 or np.allclose(x, 0):
-        return 0.0
-    x = np.sort(np.abs(x))
-    n = len(x)
-    return float((2 * np.sum((np.arange(1, n + 1)) * x) / (n * np.sum(x))) - (n + 1) / n)
-
-
-# ============================================================
-# DataProvider — 5 modos
-# ============================================================
-
-class DataProvider:
-    MODES = [
-        "Sintético reproducible",
-        "CSV agregado",
-        "DataFrame externo",
-        "Demo territorial CDMX",
-        "Carga manual"
-    ]
-
-    def __init__(self, seed=42):
-        self.seed = int(seed)
-
-    def synthetic(self, n=120):
-        rng = np.random.default_rng(self.seed)
-        rows = []
-        for i in range(n):
-            alcaldia = CDMX_ALCALDIAS[i % len(CDMX_ALCALDIAS)]
-            rows.append({
-                "territorial_unit_id": f"CDMX-SECCION-{i+1:05d}",
-                "alcaldia": alcaldia,
-                "seccion": f"{1000+i}",
-                "manzana": "",
-                "opinion_continua": float(rng.uniform(-1, 1)),
-                "capital_social": float(rng.beta(4, 4)),
-                "acceso_informacion": float(rng.beta(4, 4)),
-                "influencia_liderazgo": float(rng.beta(4, 4)),
-                "arraigo": float(rng.beta(4, 4)),
-                "nivel_movilizacion": float(rng.beta(4, 4)),
-                "desconfianza": float(rng.beta(3, 5)),
-                "exposicion_problema": float(rng.beta(4, 4)),
-            })
-        return pd.DataFrame(rows)
-
-    def from_csv(self, uploaded_file):
-        df = pd.read_csv(uploaded_file)
-        return self.normalize(df)
-
-    def from_dataframe(self, df):
-        return self.normalize(df.copy())
-
-    def normalize(self, df):
-        df = df.copy()
-        if "territorial_unit_id" not in df:
-            df["territorial_unit_id"] = [f"TU-{i+1:05d}" for i in range(len(df))]
-        if "alcaldia" not in df:
-            df["alcaldia"] = "NO_ESPECIFICADA"
-        if "seccion" not in df:
-            df["seccion"] = [str(i+1) for i in range(len(df))]
-        defaults = {
-            "manzana": "",
-            "opinion_continua": 0.0,
-            "capital_social": 0.5,
-            "acceso_informacion": 0.5,
-            "influencia_liderazgo": 0.5,
-            "arraigo": 0.5,
-            "nivel_movilizacion": 0.5,
-            "desconfianza": 0.5,
-            "exposicion_problema": 0.5,
-        }
-        for c, v in defaults.items():
-            if c not in df:
-                df[c] = v
-        return df
-
-
-# ============================================================
-# Behaviors
-# ============================================================
-
+# =============================================================================
+# BEHAVIORS (aquí se irán sumando los +35 modelos)
+# =============================================================================
 class Behavior:
-    name = "Base"
+    """Contrato común para todos los modelos sociofísicos."""
+    name = "base"
 
-    def __init__(self, params=None):
+    def __init__(self, params: dict | None = None):
         self.params = params or {}
 
-    def step_agent(self, agent):
+    def step_agent(self, agent: "SeccionAgent"):
         raise NotImplementedError
-
-    def step_model(self, model):
-        pass
 
 
 class VoterBehavior(Behavior):
-    name = "Voter / difusión local"
+    """Voter clásico ponderado por influencia."""
+    name = "voter"
 
     def step_agent(self, agent):
-        neigh = agent.neighbors()
-        if not neigh:
+        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
+        if not neighbors:
             return
-        other = agent.model.random.choice(neigh)
-        influence = float(self.params.get("influence", 0.25))
-        agent.next_opinion = clamp(
-            agent.opinion + influence * (other.opinion - agent.opinion)
-        )
+        other = agent.random.choice(neighbors)
+        beta = self.params.get("beta", 1.2)
+        prob = min(0.9, other.influencia * beta)
+        if agent.es_broker:
+            prob *= 0.3  # resistencia
+        if agent.spin != other.spin and agent.random.random() < prob:
+            agent.spin = other.spin
+            agent.opinion = 0.7 if agent.spin == 1 else (-0.7 if agent.spin == -1 else 0.0)
+            agent.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[agent.spin]
 
 
 class DeffuantBehavior(Behavior):
-    name = "Deffuant-Weisbuch"
+    """Bounded confidence + repulsión."""
+    name = "deffuant"
 
     def step_agent(self, agent):
-        neigh = agent.neighbors()
-        if not neigh:
-            agent.next_opinion = agent.opinion
+        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
+        if not neighbors:
             return
-        other = agent.model.random.choice(neigh)
-        eps = float(self.params.get("confidence", 0.25))
-        mu = float(self.params.get("mu", 0.50))
-        if abs(agent.opinion - other.opinion) <= eps:
-            agent.next_opinion = clamp(
-                agent.opinion + mu * (other.opinion - agent.opinion)
-            )
-        else:
-            agent.next_opinion = agent.opinion
+        other = agent.random.choice(neighbors)
+        mu = self.params.get("mu", 0.3)
+        eps = self.params.get("epsilon", 0.40)
+        eps_rep = self.params.get("epsilon_rep", 0.80)
+        d = abs(agent.opinion - other.opinion)
+        if d < eps:
+            delta = mu * (other.opinion - agent.opinion)
+            agent.opinion = float(np.clip(agent.opinion + delta, -1, 1))
+            other.opinion = float(np.clip(other.opinion - delta, -1, 1))
+        elif d > eps_rep:
+            delta = 0.2 * mu * (other.opinion - agent.opinion)
+            agent.opinion = float(np.clip(agent.opinion - delta, -1, 1))
+            other.opinion = float(np.clip(other.opinion + delta, -1, 1))
+        # actualizar spin
+        agent.spin = 1 if agent.opinion > 0.25 else (-1 if agent.opinion < -0.25 else 0)
+        agent.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[agent.spin]
 
 
-class SAFBehavior(Behavior):
-    name = "ABM-SAF"
+class ABMSAFBehavior(Behavior):
+    """Comportamiento compuesto inspirado en el ABM-SAF original."""
+    name = "abm_saf"
 
     def step_agent(self, agent):
-        neigh = agent.neighbors()
-        if neigh:
-            mean_neighbor = float(np.mean([a.opinion for a in neigh]))
-        else:
-            mean_neighbor = agent.opinion
+        neighbors = agent.model.grid.get_neighbors(agent.pos, include_center=False)
+        if not neighbors:
+            return
+        if agent.fatiga > 0.8 and agent.random.random() < 0.7:
+            return
+        for other in neighbors:
+            prob = agent.influencia * 0.55 * self.params.get("beta", 1.2)
+            if agent.es_broker:
+                prob *= 1.45
+            if agent.random.random() < min(prob, 0.75):
+                # Deffuant parcial
+                d = abs(agent.opinion - other.opinion)
+                if d < 0.40:
+                    other.opinion = float(np.clip(other.opinion + 0.3 * (agent.opinion - other.opinion), -1, 1))
+                # Voter
+                if abs(agent.spin - other.spin) >= 1 and agent.spin != 0:
+                    other.spin = agent.spin
+                    other.opinion = 0.7 if other.spin == 1 else -0.7
+                    other.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[other.spin]
+                agent.fatiga = min(1.0, agent.fatiga + 0.05)
+        agent.fatiga *= 0.95
 
-        # Habilidad SAF agregada: no representa una persona real.
-        skill = agent.saf_skill
-        coupling = float(self.params.get("coupling", 0.20))
-        field_pressure = float(self.params.get("field_pressure", 0.10))
-        agent.next_opinion = clamp(
-            agent.opinion
-            + coupling * skill * (mean_neighbor - agent.opinion)
-            + field_pressure * agent.exposure * (-agent.opinion)
-        )
 
-
-BEHAVIORS = {
-    "Voter / difusión local": VoterBehavior,
-    "Deffuant-Weisbuch": DeffuantBehavior,
-    "ABM-SAF": SAFBehavior,
+BEHAVIOR_REGISTRY = {
+    "voter": VoterBehavior,
+    "deffuant": DeffuantBehavior,
+    "abm_saf": ABMSAFBehavior,
 }
 
-
-def get_behavior(name, params):
-    cls = BEHAVIORS.get(name, SAFBehavior)
-    return cls(params)
-
-
-# ============================================================
-# Agents
-# ============================================================
-
+# =============================================================================
+# AGENTES MESA
+# =============================================================================
 class SeccionAgent(Agent):
-    """
-    Agente territorial agregado.
-    En Mesa 3.x/4.x el ID lo administra Mesa; el primer parámetro
-    es model. Se mantiene territorial_unit_id como identificador
-    externo reproducible.
-    """
+    """Agente territorial = Sección Electoral (extensible a Manzana)."""
 
-    def __init__(
-        self,
-        model,
-        territorial_unit_id,
-        alcaldia,
-        seccion,
-        opinion=0.0,
-        capital_social=0.5,
-        acceso_informacion=0.5,
-        influencia_liderazgo=0.5,
-        arraigo=0.5,
-        nivel_movilizacion=0.5,
-        desconfianza=0.5,
-        exposicion_problema=0.5,
-        **kwargs
-    ):
-        super().__init__(model)
-        self.territorial_unit_id = str(territorial_unit_id)
-        self.alcaldia = str(alcaldia)
+    def __init__(self, unique_id, model, alcaldia="CUAUHTEMOC", seccion="0001",
+                 lat=19.43, lon=-99.13, opinion=0.0, capital_social=0.5,
+                 influencia=0.5, es_broker=False, es_adversario=False, **kwargs):
+        super().__init__(unique_id, model)
+        self.alcaldia = alcaldia
         self.seccion = str(seccion)
-        self.manzana = str(kwargs.get("manzana", ""))
-        self.opinion = clamp(opinion)
-        self.next_opinion = self.opinion
-        self.capital_social = float(capital_social)
-        self.acceso_informacion = float(acceso_informacion)
-        self.influencia_liderazgo = float(influencia_liderazgo)
-        self.arraigo = float(arraigo)
-        self.nivel_movilizacion = float(nivel_movilizacion)
-        self.desconfianza = float(desconfianza)
-        self.exposure = float(exposicion_problema)
+        self.lat = lat
+        self.lon = lon
+        self.opinion = float(opinion)
+        self.spin = 1 if self.opinion > 0.25 else (-1 if self.opinion < -0.25 else 0)
+        self.intencion = {1: "SIMPATIZANTE", -1: "OPOSITOR", 0: "INDECISO"}[self.spin]
+        self.capital_social = capital_social
+        self.influencia = influencia
         self.fatiga = 0.0
-        self.influencia = 0.0
-        self.es_broker = False
-        self.es_adversario = False
-
-    @property
-    def spin(self):
-        if self.opinion > 0.25:
-            return 1
-        if self.opinion < -0.25:
-            return -1
-        return 0
-
-    @property
-    def saf_skill(self):
-        return clamp(
-            0.30 * self.capital_social
-            + 0.25 * self.acceso_informacion
-            + 0.25 * self.influencia_liderazgo
-            + 0.10 * self.arraigo
-            + 0.10 * self.nivel_movilizacion
-            - 0.15 * self.desconfianza,
-            0, 1
-        )
-
-    def neighbors(self):
-        return self.model.neighbors_of(self)
+        self.es_broker = es_broker
+        self.es_adversario = es_adversario
+        self.level = "seccion"  # preparado para manzana / utm
 
     def step(self):
         self.model.behavior.step_agent(self)
 
-    def advance(self):
-        self.opinion = clamp(self.next_opinion)
 
-
-class BrokerAgent(SeccionAgent):
-    """
-    Actor territorial sintético/agregado.
-    No representa una persona identificable.
-    """
-
-    def __init__(self, model, territorial_unit_id, alcaldia, seccion, **kwargs):
-        super().__init__(
-            model,
-            territorial_unit_id,
-            alcaldia,
-            seccion,
-            **kwargs
-        )
-        self.es_broker = True
-        self.capital_social = float(kwargs.get("capital", 0.90))
-        self.influencia_liderazgo = float(kwargs.get("liderazgo", 0.90))
-
-
-# ============================================================
-# SITERModel — Mesa
-# ============================================================
-
+# =============================================================================
+# MODELO MESA PRINCIPAL
+# =============================================================================
 class SITERModel(Model):
-    """
-    Mundo territorial CDMX implementado sobre Mesa.
+    """Mundo CDMX estilo NetLogo implementado en Mesa."""
 
-    Scheduler moderno:
-      RandomActivation    -> self.agents.shuffle_do("step")
-      Simultaneous        -> self.agents.do("step") + advance()
+    def __init__(self, df_state: pd.DataFrame, adj: dict,
+                 behavior: str = "voter", seed: int = 42, **params):
+        super().__init__()
+        self.seed = seed
+        self.random.seed(seed)
+        np.random.seed(seed)
 
-    Se mantiene un NetworkX graph como representación canónica de
-    relaciones; se intenta montar además el espacio de red de Mesa
-    cuando la versión instalada lo permite.
-    """
+        # Grafo de red
+        G = nx.Graph()
+        for i in range(len(df_state)):
+            G.add_node(i)
+        for k, vs in adj.items():
+            for v in vs:
+                if int(k) < len(df_state) and int(v) < len(df_state):
+                    G.add_edge(int(k), int(v))
+        self.G = G
+        self.grid = NetworkGrid(G)
+        self.schedule = SimultaneousActivation(self)
 
-    def __init__(
-        self,
-        df_state,
-        behavior="ABM-SAF",
-        seed=42,
-        p_intra=0.06,
-        p_inter=0.015,
-        activation="Simultaneous",
-        **params
-    ):
-        super().__init__(seed=seed)
-        self.seed_value = int(seed)
+        # Behavior intercambiable
+        behavior_cls = BEHAVIOR_REGISTRY.get(behavior, VoterBehavior)
+        self.behavior = behavior_cls(params)
         self.behavior_name = behavior
-        self.behavior = get_behavior(behavior, params)
-        self.p_intra = float(p_intra)
-        self.p_inter = float(p_inter)
-        self.activation = activation
-        self.params = params
-        self.df_state = df_state.reset_index(drop=True).copy()
 
-        self.G = nx.Graph()
-        self.agent_by_tu = {}
-        self._build_agents()
-        self._build_network()
-        self._build_mesa_space()
+        # Crear agentes
+        for i, row in df_state.reset_index(drop=True).iterrows():
+            agent = SeccionAgent(
+                unique_id=i,
+                model=self,
+                alcaldia=row.get("alcaldia", "CUAUHTEMOC"),
+                seccion=row.get("seccion", row.get("territorial_unit_id", f"{i:04d}")),
+                lat=float(row.get("lat", 19.43)),
+                lon=float(row.get("lon", -99.13)),
+                opinion=float(row.get("opinion_continua", 0.0)),
+                capital_social=float(row.get("capital_social", 0.5)),
+                influencia=float(row.get("influencia_SAF", row.get("habilidades_sociales", 0.5))),
+                es_broker=bool(row.get("es_broker_insertado", False)),
+                es_adversario=bool(row.get("es_adversario", False)),
+            )
+            self.schedule.add(agent)
+            self.grid.place_agent(agent, i)
 
         self.datacollector = DataCollector(
             model_reporters={
                 "SIMPATIZANTE": lambda m: m.count_spin(1),
                 "OPOSITOR": lambda m: m.count_spin(-1),
                 "INDECISO": lambda m: m.count_spin(0),
-                "Gini": lambda m: m.compute_gini(),
-                "Polarizacion": lambda m: m.compute_polarization(),
-                "MeanOpinion": lambda m: m.mean_opinion(),
+                "n_brokers": lambda m: sum(1 for a in m.schedule.agents if a.es_broker),
             },
-            agent_reporters={
-                "opinion": "opinion",
-                "spin": "spin",
-                "saf_skill": "saf_skill",
-                "influencia": "influencia",
-                "es_broker": "es_broker",
-            },
+            agent_reporters={"opinion": "opinion", "spin": "spin", "alcaldia": "alcaldia"}
         )
-        self.datacollector.collect(self)
-
-    def _build_agents(self):
-        for _, row in self.df_state.iterrows():
-            a = SeccionAgent(
-                self,
-                row["territorial_unit_id"],
-                row["alcaldia"],
-                row["seccion"],
-                opinion=row.get("opinion_continua", 0.0),
-                capital_social=row.get("capital_social", 0.5),
-                acceso_informacion=row.get("acceso_informacion", 0.5),
-                influencia_liderazgo=row.get("influencia_liderazgo", 0.5),
-                arraigo=row.get("arraigo", 0.5),
-                nivel_movilizacion=row.get("nivel_movilizacion", 0.5),
-                desconfianza=row.get("desconfianza", 0.5),
-                exposicion_problema=row.get("exposicion_problema", 0.5),
-                manzana=row.get("manzana", ""),
-            )
-            self.agent_by_tu[a.territorial_unit_id] = a
-            self.G.add_node(a.unique_id, territorial_unit_id=a.territorial_unit_id)
-
-    def _build_network(self):
-        rng = np.random.default_rng(self.seed_value)
-        agents = list(self.agent_by_tu.values())
-        for i, a in enumerate(agents):
-            for b in agents[i + 1:]:
-                p = self.p_intra if a.alcaldia == b.alcaldia else self.p_inter
-                if rng.random() < p:
-                    self.G.add_edge(a.unique_id, b.unique_id)
-
-        # Asegurar conectividad local mínima sin imponer una red completa.
-        if len(agents) > 1:
-            for i in range(len(agents) - 1):
-                if not self.G.has_edge(agents[i].unique_id, agents[i+1].unique_id):
-                    if rng.random() < 0.20:
-                        self.G.add_edge(agents[i].unique_id, agents[i+1].unique_id)
-
-        degree = dict(self.G.degree())
-        max_degree = max(degree.values(), default=1)
-        for a in agents:
-            a.influencia = degree.get(a.unique_id, 0) / max_degree if max_degree else 0.0
-
-    def _build_mesa_space(self):
-        self.mesa_space = None
-        if LegacyNetworkGrid is not None:
-            try:
-                self.mesa_space = LegacyNetworkGrid(self.G)
-                for a in self.agent_by_tu.values():
-                    self.mesa_space.place_agent(a, a.unique_id)
-                return
-            except Exception:
-                self.mesa_space = None
-
-        if MesaNetwork is not None:
-            try:
-                self.mesa_space = MesaNetwork(self.G, random=self.random)
-                for a in self.agent_by_tu.values():
-                    self.mesa_space[a.unique_id].agents.add(a)
-            except Exception:
-                self.mesa_space = None
-
-    def neighbors_of(self, agent):
-        ids = list(self.G.neighbors(agent.unique_id))
-        reverse = {a.unique_id: a for a in self.agent_by_tu.values()}
-        return [reverse[i] for i in ids if i in reverse]
-
-    def step(self):
-        if self.activation.lower().startswith("random"):
-            self.agents.shuffle_do("step")
-            # Random activation updates immediately through advance only
-            # after all decisions have been calculated.
-            self.agents.do("advance")
-        else:
-            self.agents.do("step")
-            self.agents.do("advance")
-        self.datacollector.collect(self)
+        self.datacollector.collect(self)  # estado inicial
+        self.running = True
 
     def count_spin(self, value):
-        n = len(self.agents)
-        return 0.0 if n == 0 else sum(a.spin == value for a in self.agents) / n
+        agents = self.schedule.agents
+        if not agents:
+            return 0.0
+        return sum(1 for a in agents if a.spin == value) / len(agents)
 
-    def mean_opinion(self):
-        return float(np.mean([a.opinion for a in self.agents])) if len(self.agents) else 0.0
+    def step(self):
+        self.schedule.step()
+        self.datacollector.collect(self)
 
-    def compute_polarization(self):
-        vals = np.asarray([a.opinion for a in self.agents], dtype=float)
-        return float(np.std(vals)) if len(vals) else 0.0
+    def get_agents_df(self) -> pd.DataFrame:
+        rows = []
+        for a in self.schedule.agents:
+            rows.append({
+                "agent_id": f"{'BROKER' if a.es_broker else 'SEC'}-{a.unique_id}",
+                "alcaldia": a.alcaldia,
+                "seccion": a.seccion,
+                "lat": a.lat,
+                "lon": a.lon,
+                "opinion": a.opinion,
+                "spin": a.spin,
+                "intencion": a.intencion,
+                "influencia": a.influencia,
+                "es_broker": a.es_broker,
+                "fatiga": a.fatiga,
+            })
+        return pd.DataFrame(rows)
 
-    def compute_gini(self):
-        return gini([abs(a.opinion) for a in self.agents])
-
-    def inject_broker(self, territorial_unit_id=None, source_agent=None):
-        if source_agent is None:
-            if territorial_unit_id and territorial_unit_id in self.agent_by_tu:
-                source_agent = self.agent_by_tu[territorial_unit_id]
-            else:
-                source_agent = self.random.choice(list(self.agent_by_tu.values()))
-
-        broker_id = f"{source_agent.territorial_unit_id}-BROKER"
-        if broker_id in self.agent_by_tu:
-            return self.agent_by_tu[broker_id]
-
-        broker = BrokerAgent(
-            self,
-            broker_id,
-            source_agent.alcaldia,
-            source_agent.seccion,
-            opinion=source_agent.opinion,
-            capital=0.90,
-            liderazgo=0.90,
-            acceso_informacion=0.90,
-            arraigo=0.85,
-            nivel_movilizacion=0.85,
-            desconfianza=0.10,
-            exposicion_problema=source_agent.exposure,
+    def insert_broker(self, lat: float, lon: float, alcaldia: str,
+                      capital: float = 0.9, intencion: str = "SIMPATIZANTE",
+                      grado: int = 15):
+        """Inserta un broker en la ubicación dada y lo conecta a vecinos influyentes."""
+        new_id = max(a.unique_id for a in self.schedule.agents) + 1
+        opinion = 0.75 if intencion == "SIMPATIZANTE" else (-0.75 if intencion == "OPOSITOR" else 0.0)
+        broker = SeccionAgent(
+            unique_id=new_id, model=self, alcaldia=alcaldia, seccion=f"BRK{new_id}",
+            lat=lat, lon=lon, opinion=opinion, capital_social=capital,
+            influencia=0.95, es_broker=True
         )
-        self.agent_by_tu[broker_id] = broker
-        self.G.add_node(broker.unique_id, territorial_unit_id=broker_id)
-
-        # Conecta el broker con los nodos territorialmente próximos
-        # del mismo municipio/alcaldía.
-        candidates = [
-            a for a in self.agent_by_tu.values()
-            if a is not broker and a.alcaldia == source_agent.alcaldia
-        ]
-        candidates = sorted(candidates, key=lambda a: a.influencia, reverse=True)[:5]
-        for a in candidates:
-            self.G.add_edge(broker.unique_id, a.unique_id)
-
-        broker.influencia = 1.0
+        self.schedule.add(broker)
+        # Conectar a los más influyentes de la misma alcaldía o cercanos
+        candidatos = sorted(
+            [a for a in self.schedule.agents if a.unique_id != new_id],
+            key=lambda x: x.influencia, reverse=True
+        )[:grado * 2]
+        self.G.add_node(new_id)
+        for c in candidatos[:grado]:
+            self.G.add_edge(new_id, c.unique_id)
+        self.grid.place_agent(broker, new_id)
         return broker
 
-    def model_dataframe(self):
-        return self.datacollector.get_model_vars_dataframe()
 
-    def agent_dataframe(self):
-        return self.datacollector.get_agent_vars_dataframe()
+# =============================================================================
+# DATA PROVIDER (5 modos) — simplificado y compatible
+# =============================================================================
+class DataProvider:
+    def __init__(self, mode="synth_pure", seed=42):
+        self.mode = mode
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
 
-    def snapshot(self):
-        return {
-            "seed": self.seed_value,
-            "behavior": self.behavior_name,
-            "activation": self.activation,
-            "n_agents": len(self.agents),
-            "n_edges": self.G.number_of_edges(),
-            "step": int(self.steps),
-            "mean_opinion": self.mean_opinion(),
-            "gini": self.compute_gini(),
-            "polarization": self.compute_polarization(),
-        }
+    def load(self, n=300, **kwargs):
+        if self.mode == "dummy":
+            return self._dummy(n)
+        if self.mode == "synth_coherent":
+            return self._coherent(n)
+        if self.mode == "synth_calib":
+            return self._calib(kwargs.get("scenario", "polarizacion_alta"), n)
+        # default: synth_pure
+        return self._pure(n)
+
+    def _pure(self, n):
+        rows = []
+        for i in range(n):
+            alc = str(self.rng.choice(ALCALDIAS_CDMX))
+            lat, lon = ALCALDIA_COORDS[alc]
+            opinion = float(self.rng.uniform(-0.8, 0.8))
+            rows.append({
+                "seccion": f"{i:04d}", "alcaldia": alc,
+                "lat": lat + self.rng.normal(0, 0.012),
+                "lon": lon + self.rng.normal(0, 0.012),
+                "opinion_continua": opinion,
+                "capital_social": float(self.rng.uniform(0.3, 0.8)),
+                "influencia_SAF": float(self.rng.uniform(0.2, 0.9)),
+                "es_broker_insertado": False, "es_adversario": False,
+            })
+        df = pd.DataFrame(rows)
+        adj = self._build_adj(df)
+        return df, adj
+
+    def _dummy(self, n):
+        return self._pure(min(n, 60))
+
+    def _coherent(self, n):
+        rows = []
+        for i in range(n):
+            alc = str(self.rng.choice(ALCALDIAS_CDMX))
+            lat, lon = ALCALDIA_COORDS[alc]
+            share = float(np.clip(self.rng.normal(0.37, 0.14), 0.05, 0.95))
+            opinion = 2 * share - 1
+            rows.append({
+                "seccion": f"C{i:04d}", "alcaldia": alc,
+                "lat": lat + self.rng.normal(0, 0.01),
+                "lon": lon + self.rng.normal(0, 0.01),
+                "opinion_continua": opinion,
+                "capital_social": float(np.clip(1 - self.rng.normal(0.4, 0.15), 0.2, 0.9)),
+                "influencia_SAF": float(self.rng.uniform(0.3, 0.85)),
+                "es_broker_insertado": False, "es_adversario": False,
+            })
+        df = pd.DataFrame(rows)
+        adj = self._build_adj(df, p_intra=0.07, p_inter=0.02)
+        return df, adj
+
+    def _calib(self, scenario, n):
+        # polarizacion_alta simplificada
+        half = n // 2
+        rows = []
+        for i in range(n):
+            bloque = 0 if i < half else 1
+            alc = ALCALDIAS_CDMX[bloque * 4 + (i % 4)]
+            lat, lon = ALCALDIA_COORDS[alc]
+            opinion = 0.75 if bloque == 0 else -0.75
+            opinion = float(np.clip(opinion + self.rng.normal(0, 0.08), -1, 1))
+            rows.append({
+                "seccion": f"P{i:04d}", "alcaldia": alc,
+                "lat": lat + self.rng.normal(0, 0.008),
+                "lon": lon + self.rng.normal(0, 0.008),
+                "opinion_continua": opinion,
+                "capital_social": 0.6, "influencia_SAF": 0.5,
+                "es_broker_insertado": False, "es_adversario": False,
+            })
+        df = pd.DataFrame(rows)
+        adj = self._build_adj(df, p_intra=0.12, p_inter=0.005)
+        return df, adj
+
+    def _build_adj(self, df, p_intra=0.08, p_inter=0.02):
+        adj = defaultdict(list)
+        for alc in df["alcaldia"].unique():
+            idxs = df.index[df["alcaldia"] == alc].tolist()
+            for a in range(len(idxs)):
+                for b in range(a + 1, len(idxs)):
+                    if self.rng.random() < p_intra:
+                        x, y = idxs[a], idxs[b]
+                        adj[x].append(y)
+                        adj[y].append(x)
+        # inter simple
+        alcs = list(df["alcaldia"].unique())
+        for i, a1 in enumerate(alcs):
+            for a2 in alcs[i+1:]:
+                idxs1 = df.index[df["alcaldia"] == a1].tolist()
+                idxs2 = df.index[df["alcaldia"] == a2].tolist()
+                for x in idxs1[:5]:
+                    for y in idxs2[:5]:
+                        if self.rng.random() < p_inter:
+                            adj[x].append(y)
+                            adj[y].append(x)
+        return dict(adj)
 
 
-# ============================================================
-# UI
-# ============================================================
+# =============================================================================
+# STREAMLIT UI — ESTILO NETLOGO
+# =============================================================================
+st.set_page_config(page_title="SITER-CDMX v5.4 Mesa", page_icon="🧠", layout="wide")
+st.title("🧠 SITER-CDMX v5.4 — Mesa + NetLogo-style")
+st.caption("Motor Mesa · Behaviors intercambiables · 5 modos de datos · Controles Setup/Go · CDMX")
 
-st.set_page_config(
-    page_title="SITER-CDMX + Mesa",
-    page_icon="🧬",
-    layout="wide",
-)
+if "s54" not in st.session_state:
+    st.session_state.s54 = {
+        "model": None, "df": pd.DataFrame(), "adj": {},
+        "tray": [], "running": False, "tick": 0,
+        "behavior": "voter", "meta": {}
+    }
+S = st.session_state.s54
 
-st.title("🧬 SITER-CDMX + Mesa")
-st.caption(
-    "Laboratorio computacional territorial · Streamlit + Mesa · "
-    "CDMX únicamente · agentes agregados/sintéticos"
-)
+# ----- SIDEBAR -----
+st.sidebar.header("⚙️ Setup (NetLogo-style)")
 
-if not MESA_OK:
-    st.error("Mesa no pudo importarse.")
-    st.code(MESA_IMPORT_ERROR)
-    st.stop()
+data_mode = st.sidebar.selectbox("Modo de datos", ["synth_pure", "dummy", "synth_coherent", "synth_calib"], index=0)
+seed = st.sidebar.number_input("Seed", 1, 99999, 42)
+n = st.sidebar.slider("N secciones", 50, 800, 300, 50)
+behavior = st.sidebar.selectbox("Behavior (modelo)", list(BEHAVIOR_REGISTRY.keys()), index=0)
+beta = st.sidebar.slider("Beta", 0.3, 2.5, 1.2, 0.1)
+steps_per_go = st.sidebar.slider("Pasos por Go", 1, 20, 5)
 
-with st.sidebar:
-    st.header("⚙️ Setup")
+if data_mode == "synth_calib":
+    scenario = st.sidebar.selectbox("Escenario", ["polarizacion_alta"])
+else:
+    scenario = "polarizacion_alta"
 
-    seed = st.number_input("Seed", min_value=0, max_value=999999, value=42)
-    n_agents = st.slider("Unidades territoriales", 20, 500, 120, 10)
+col_setup, col_go, col_stop = st.sidebar.columns(3)
 
-    behavior_name = st.selectbox("Behavior", list(BEHAVIORS.keys()))
-    activation = st.radio(
-        "Activación",
-        ["Simultaneous", "Random"],
-        index=0
-    )
+with col_setup:
+    if st.button("🔄 Setup", use_container_width=True):
+        provider = DataProvider(mode=data_mode, seed=seed)
+        df, adj = provider.load(n=n, scenario=scenario)
+        model = SITERModel(df, adj, behavior=behavior, seed=seed, beta=beta)
+        S.update({
+            "model": model, "df": df, "adj": adj,
+            "tray": [{"step": 0, "SIMPATIZANTE": model.count_spin(1),
+                      "OPOSITOR": model.count_spin(-1), "INDECISO": model.count_spin(0)}],
+            "tick": 0, "running": False, "behavior": behavior
+        })
+        st.success(f"Setup OK · {len(df)} secciones · {behavior}")
 
-    p_intra = st.slider("p intra-alcaldía", 0.0, 0.30, 0.06, 0.005)
-    p_inter = st.slider("p inter-alcaldía", 0.0, 0.10, 0.015, 0.005)
+with col_go:
+    if st.button("▶️ Go", use_container_width=True):
+        if S["model"] is None:
+            st.warning("Haz Setup primero")
+        else:
+            for _ in range(steps_per_go):
+                S["model"].step()
+                S["tick"] += 1
+                S["tray"].append({
+                    "step": S["tick"],
+                    "SIMPATIZANTE": S["model"].count_spin(1),
+                    "OPOSITOR": S["model"].count_spin(-1),
+                    "INDECISO": S["model"].count_spin(0),
+                })
+            st.rerun()
 
-    confidence = st.slider("Confianza Deffuant", 0.01, 1.0, 0.25, 0.01)
-    coupling = st.slider("Acoplamiento SAF", 0.0, 1.0, 0.20, 0.01)
-    field_pressure = st.slider("Presión de campo", 0.0, 1.0, 0.10, 0.01)
-
-    steps_to_run = st.slider("Pasos por Go", 1, 25, 1)
-
-    if st.button("🔄 SETUP", use_container_width=True):
-        st.session_state.pop("siter_model", None)
-        st.session_state.pop("data_provider", None)
+with col_stop:
+    if st.button("⏹ Reset", use_container_width=True):
+        S["model"] = None
+        S["tray"] = []
+        S["tick"] = 0
         st.rerun()
 
-provider = DataProvider(seed=seed)
-
-if "siter_model" not in st.session_state:
-    df = provider.synthetic(n_agents)
-    model = SITERModel(
-        df,
-        behavior=behavior_name,
-        seed=seed,
-        p_intra=p_intra,
-        p_inter=p_inter,
-        activation=activation,
-        confidence=confidence,
-        coupling=coupling,
-        field_pressure=field_pressure,
-    )
-    st.session_state.siter_model = model
-    st.session_state.source_df = df
-
-model = st.session_state.siter_model
-
-# Rebuild if setup controls changed
-signature = (
-    seed, n_agents, behavior_name, activation, round(p_intra, 4),
-    round(p_inter, 4), round(confidence, 4), round(coupling, 4),
-    round(field_pressure, 4)
-)
-if st.session_state.get("signature") != signature:
-    df = provider.synthetic(n_agents)
-    model = SITERModel(
-        df,
-        behavior=behavior_name,
-        seed=seed,
-        p_intra=p_intra,
-        p_inter=p_inter,
-        activation=activation,
-        confidence=confidence,
-        coupling=coupling,
-        field_pressure=field_pressure,
-    )
-    st.session_state.siter_model = model
-    st.session_state.source_df = df
-    st.session_state.signature = signature
-
-model = st.session_state.siter_model
-
-# ------------------------------------------------------------
-# NetLogo-like controls
-# ------------------------------------------------------------
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    if st.button("▶ GO", use_container_width=True):
-        for _ in range(steps_to_run):
-            model.step()
+# Broker rápido
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 Insertar Broker")
+broker_alc = st.sidebar.selectbox("Alcaldía del broker", ALCALDIAS_CDMX)
+broker_int = st.sidebar.selectbox("Intención", ["SIMPATIZANTE", "OPOSITOR", "INDECISO"])
+if st.sidebar.button("➕ Insertar Broker"):
+    if S["model"] is None:
+        st.sidebar.warning("Haz Setup primero")
+    else:
+        lat, lon = ALCALDIA_COORDS[broker_alc]
+        S["model"].insert_broker(lat, lon, broker_alc, capital=0.9, intencion=broker_int)
+        st.sidebar.success("Broker insertado")
         st.rerun()
 
-with c2:
-    if st.button("⏩ GO ×10", use_container_width=True):
-        for _ in range(10):
-            model.step()
-        st.rerun()
+# ----- MAIN PANEL -----
+if S["model"] is None:
+    st.info("➡️ Pulsa **Setup** en la barra lateral para generar el universo (estilo NetLogo).")
+else:
+    model: SITERModel = S["model"]
+    agents_df = model.get_agents_df()
 
-with c3:
-    if st.button("🧬 INSERT BROKER", use_container_width=True):
-        model.inject_broker()
-        st.rerun()
+    # Monitors (estilo NetLogo)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Tick", S["tick"])
+    c2.metric("Simpatizantes", f"{model.count_spin(1):.1%}")
+    c3.metric("Opositores", f"{model.count_spin(-1):.1%}")
+    c4.metric("Indecisos", f"{model.count_spin(0):.1%}")
+    c5.metric("Brokers", sum(1 for a in model.schedule.agents if a.es_broker))
 
-with c4:
-    if st.button("↩ RESET", use_container_width=True):
-        st.session_state.pop("siter_model", None)
-        st.rerun()
+    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ World View", "📈 Plots", "📋 Agentes", "ℹ️ Modelo"])
 
-# ------------------------------------------------------------
-# Monitors
-# ------------------------------------------------------------
-snap = model.snapshot()
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Paso", snap["step"])
-m2.metric("Simpatizante", f"{model.count_spin(1):.2%}")
-m3.metric("Opositor", f"{model.count_spin(-1):.2%}")
-m4.metric("Gini", f"{model.compute_gini():.3f}")
-m5.metric("Polarización", f"{model.compute_polarization():.3f}")
-
-# ------------------------------------------------------------
-# Main view
-# ------------------------------------------------------------
-left, right = st.columns([1.25, 1])
-
-with left:
-    st.subheader("🌐 World View — Red territorial")
-    pos = nx.spring_layout(model.G, seed=seed, k=0.45, iterations=30)
-    edges_x, edges_y = [], []
-    for u, v in model.G.edges():
-        edges_x += [pos[u][0], pos[v][0], None]
-        edges_y += [pos[u][1], pos[v][1], None]
-
-    st.plotly_chart(
-        go.Figure(
-            data=[
-                go.Scatter(
-                    x=edges_x,
-                    y=edges_y,
-                    mode="lines",
-                    hoverinfo="skip",
-                ),
-                go.Scatter(
-                    x=[pos[a.unique_id][0] for a in model.agents],
-                    y=[pos[a.unique_id][1] for a in model.agents],
-                    mode="markers",
-                    text=[
-                        f"{a.alcaldia}<br>{a.territorial_unit_id}"
-                        for a in model.agents
-                    ],
-                    hovertemplate="%{text}<extra></extra>",
-                    marker=dict(
-                        size=[
-                            14 if a.es_broker else 7
-                            for a in model.agents
-                        ],
-                        color=[
-                            a.opinion for a in model.agents
-                        ],
-                        colorscale="RdBu",
-                        cmin=-1,
-                        cmax=1,
-                        showscale=True,
-                        colorbar=dict(title="Estado"),
-                    ),
-                )
-            ],
-            layout=dict(
-                height=650,
-                margin=dict(l=0, r=0, t=10, b=0),
-                xaxis=dict(showgrid=False, zeroline=False, visible=False),
-                yaxis=dict(showgrid=False, zeroline=False, visible=False),
-            ),
-        ),
-        use_container_width=True,
-    )
-
-with right:
-    st.subheader("📈 Monitores")
-    hist = model.model_dataframe().reset_index()
-    if not hist.empty:
-        fig = go.Figure()
-        for col in ["SIMPATIZANTE", "OPOSITOR", "INDECISO"]:
-            if col in hist:
+    with tab1:
+        st.subheader("World View (NetLogo-style)")
+        if HAS_PLOTLY:
+            fig = px.scatter(
+                agents_df, x="lon", y="lat",
+                color="intencion", size="influencia",
+                hover_name="agent_id",
+                color_discrete_map=COLOR_INTENCION,
+                hover_data=["alcaldia", "seccion", "opinion", "spin"],
+                title=f"Secciones CDMX · Behavior: {S['behavior']} · Tick {S['tick']}",
+                size_max=28
+            )
+            # Brokers como estrellas
+            brokers = agents_df[agents_df["es_broker"]]
+            if not brokers.empty:
                 fig.add_trace(go.Scatter(
-                    x=hist["Step"],
-                    y=hist[col],
-                    mode="lines+markers",
-                    name=col,
+                    x=brokers["lon"], y=brokers["lat"],
+                    mode="markers", marker=dict(symbol="star", size=22, color="gold",
+                                                line=dict(width=1, color="black")),
+                    name="Broker", text=brokers["agent_id"]
                 ))
-        fig.update_layout(height=350, margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(height=600, template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.dataframe(agents_df)
 
-        fig2 = go.Figure()
-        for col in ["Gini", "Polarizacion", "MeanOpinion"]:
-            if col in hist:
-                fig2.add_trace(go.Scatter(
-                    x=hist["Step"],
-                    y=hist[col],
-                    mode="lines",
-                    name=col,
-                ))
-        fig2.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig2, use_container_width=True)
+        # Resumen por alcaldía
+        by_alc = agents_df.groupby("alcaldia")["intencion"].value_counts(normalize=True).unstack(fill_value=0)
+        st.markdown("**Distribución por Alcaldía**")
+        st.dataframe(by_alc.style.format("{:.1%}"), use_container_width=True)
 
-# ------------------------------------------------------------
-# Territorial table
-# ------------------------------------------------------------
-st.subheader("🗺️ Estado territorial agregado")
+    with tab2:
+        if S["tray"]:
+            tray_df = pd.DataFrame(S["tray"])
+            st.line_chart(tray_df.set_index("step")[["SIMPATIZANTE", "OPOSITOR", "INDECISO"]])
+            if HAS_PLOTLY:
+                fig = go.Figure()
+                for col, color in [("SIMPATIZANTE", "#2ecc71"), ("OPOSITOR", "#e74c3c"), ("INDECISO", "#95a5a6")]:
+                    fig.add_trace(go.Scatter(x=tray_df["step"], y=tray_df[col], name=col, line=dict(color=color)))
+                fig.update_layout(title="Trayectoria de opiniones", height=400, template="plotly_dark")
+                st.plotly_chart(fig, use_container_width=True)
 
-rows = []
-for a in model.agents:
-    rows.append({
-        "territorial_unit_id": a.territorial_unit_id,
-        "alcaldia": a.alcaldia,
-        "seccion": a.seccion,
-        "opinion": round(a.opinion, 4),
-        "spin": a.spin,
-        "saf_skill": round(a.saf_skill, 4),
-        "influencia": round(a.influencia, 4),
-        "broker": bool(a.es_broker),
-    })
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    with tab3:
+        st.dataframe(agents_df, use_container_width=True)
 
-# ------------------------------------------------------------
-# Experiment / reproducibility
-# ------------------------------------------------------------
-st.subheader("🧪 Experiment / reproducibilidad")
+    with tab4:
+        st.json({
+            "behavior": S["behavior"],
+            "n_agents": len(model.schedule.agents),
+            "n_edges": model.G.number_of_edges(),
+            "tick": S["tick"],
+            "seed": model.seed,
+        })
+        st.markdown("""
+        **Behaviors disponibles (camino a +35 modelos):**
+        - `voter` — Voter clásico ponderado
+        - `deffuant` — Bounded confidence + repulsión
+        - `abm_saf` — Compuesto (Voter + Deffuant + fatiga)
 
-experiment_payload = {
-    "seed": seed,
-    "behavior": behavior_name,
-    "activation": activation,
-    "n_agents": n_agents,
-    "p_intra": p_intra,
-    "p_inter": p_inter,
-    "confidence": confidence,
-    "coupling": coupling,
-    "field_pressure": field_pressure,
-    "step": int(model.steps),
-}
-experiment_id = "EXP-" + sha256_obj(experiment_payload)[:12]
-output_hash = sha256_obj({
-    "experiment": experiment_payload,
-    "snapshot": model.snapshot(),
-})
+        Próximos: Threshold, q-Voter, Schelling, Complex Contagion, HK, DeGroot, FJ, Axelrod...
+        """)
 
-e1, e2 = st.columns(2)
-e1.code(f"experiment_id = {experiment_id}")
-e2.code(f"output_hash = {output_hash[:20]}…")
-
-export = {
-    "metadata": {
-        "experiment_id": experiment_id,
-        "seed": seed,
-        "output_hash": output_hash,
-        "data_origin": "CALCULATED_FROM_SYNTHETIC_OR_AGGREGATED",
-        "geography": "CDMX",
-    },
-    "model": model.snapshot(),
-    "territorial_fields": rows,
-    "model_timeseries": model.model_dataframe().reset_index().to_dict("records"),
-}
-
-st.download_button(
-    "⬇️ Exportar experimento JSON",
-    data=json.dumps(export, ensure_ascii=False, indent=2),
-    file_name=f"{experiment_id}.json",
-    mime="application/json",
-)
-
-st.info(
-    "Principio metodológico: la granularidad de la conclusión no debe "
-    "superar la granularidad de la evidencia. Este esqueleto trabaja "
-    "con unidades territoriales agregadas/sintéticas."
-)
+st.sidebar.markdown("---")
+st.sidebar.caption("SITER-CDMX v5.4 · Mesa · Estilo NetLogo · Sin PII")
