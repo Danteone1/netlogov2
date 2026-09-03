@@ -162,7 +162,7 @@ class Lab:
         self.G=G
         deg=dict(G.degree())
         btw=nx.betweenness_centrality(G,k=min(100,len(G)),seed=self.seed) if len(G)>2 else {}
-        eig=nx.eigenvector_centrality_numpy(G) if G.number_of_edges() else {x:0 for x in G}
+        eig=nx.eigenvector_centrality(G, max_iter=100, tol=1e-6) if G.number_of_edges() else {x:0 for x in G}
         self.network=pd.DataFrame([{
             "agent_id":a.id,"territorio":a.territorio,"grado":deg[a.id],
             "betweenness":btw.get(a.id,0),"eigenvector":eig.get(a.id,0),
